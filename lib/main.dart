@@ -1,7 +1,15 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
 import 'screens/upload_pothole.dart';
+import 'services/background_service.dart';
 
-void main() {
+// =====================================================
+// MAIN
+// =====================================================
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await initBackgroundService();
   runApp(const RoadGuardApp());
 }
 
@@ -16,7 +24,7 @@ class RoadGuardApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'RoadGuard',
+      title: 'Road Guard AI',
 
       theme: ThemeData(
         primarySwatch: Colors.blue,
@@ -40,15 +48,26 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
 
-  // false = STOP
-  // true  = START
+  // false = STOPPED  →  green START button
+  // true  = RUNNING  →  red STOP button
   bool isRunning = false;
 
   // ===================================================
   // START / STOP BUTTON
   // ===================================================
 
-  void toggleMonitoring() {
+  void toggleMonitoring() async {
+    final service = FlutterBackgroundService();
+
+    if (!isRunning) {
+      // Show battery optimization tip on first start
+      _showBatteryTip();
+
+      await service.startService();
+    } else {
+      service.invoke('stop');
+    }
+
     setState(() {
       isRunning = !isRunning;
     });
@@ -61,6 +80,31 @@ class _HomeScreenState extends State<HomeScreen> {
               : "Monitoring Stopped",
         ),
         duration: const Duration(seconds: 1),
+      ),
+    );
+  }
+
+  // ===================================================
+  // BATTERY TIP DIALOG
+  // ===================================================
+
+  void _showBatteryTip() {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text("Keep Road Guard Running"),
+        content: const Text(
+          "For uninterrupted monitoring, go to:\n\n"
+          "Settings → Battery → Road Guard AI\n"
+          "→ Set to 'Unrestricted' or 'No restrictions'\n\n"
+          "This ensures the app keeps monitoring even when minimized.",
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Got it"),
+          ),
+        ],
       ),
     );
   }
@@ -79,7 +123,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
       appBar: AppBar(
         title: const Text(
-          "RoadGuard",
+          "Road Guard AI",
           style: TextStyle(
             fontWeight: FontWeight.bold,
           ),
@@ -106,7 +150,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
               child: Center(
                 child: Text(
-                  "RoadGuard",
+                  "Road Guard AI",
                   style: TextStyle(
                     color: Colors.white,
                     fontSize: 28,
@@ -185,7 +229,7 @@ class _HomeScreenState extends State<HomeScreen> {
             // -------------------------------------------
 
             const Text(
-              "RoadGuard",
+              "Road Guard AI",
 
               style: TextStyle(
                 fontSize: 34,
@@ -202,13 +246,13 @@ class _HomeScreenState extends State<HomeScreen> {
             Text(
               isRunning
                   ? "Monitoring is active"
-                  : "Monitoring is stopped",
+                  : "Tap START to begin monitoring",
 
               style: TextStyle(
                 fontSize: 18,
                 color: isRunning
                     ? Colors.green
-                    : Colors.red,
+                    : Colors.grey,
               ),
             ),
 
@@ -228,12 +272,12 @@ class _HomeScreenState extends State<HomeScreen> {
 
                 style: ElevatedButton.styleFrom(
 
-                  // STOP = RED
-                  // START = GREEN
+                  // STOPPED = GREEN (tap to START)
+                  // RUNNING = RED   (tap to STOP)
                   backgroundColor:
                       isRunning
-                          ? Colors.green
-                          : Colors.red,
+                          ? Colors.red
+                          : Colors.green,
 
                   foregroundColor: Colors.white,
 
@@ -248,8 +292,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Text(
 
                   isRunning
-                      ? "START"
-                      : "STOP",
+                      ? "STOP"
+                      : "START",
 
                   style: const TextStyle(
                     fontSize: 28,
@@ -268,7 +312,7 @@ class _HomeScreenState extends State<HomeScreen> {
             Text(
               isRunning
                   ? "Tap to stop monitoring"
-                  : "Tap to start monitoring",
+                  : "Tap START to monitor roads",
 
               style: const TextStyle(
                 fontSize: 16,

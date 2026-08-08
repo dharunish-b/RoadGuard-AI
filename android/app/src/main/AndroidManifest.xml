@@ -1,4 +1,5 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <queries>
         <intent>
@@ -7,9 +8,18 @@
         </intent>
     </queries>
 
+    <!-- ✅ ADDED: Required for foreground service (background monitoring) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- ✅ ADDED: Required because the foreground service uses GPS location -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+
+    <!-- ✅ ADDED: Required to show the "Monitoring active" status bar notification -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:name="${applicationName}"
-        android:label="RoadGuard"
+        android:label="Road Guard AI"
         android:icon="@mipmap/ic_launcher">
 
         <activity
@@ -32,6 +42,13 @@
             </intent-filter>
 
         </activity>
+
+        <!-- ✅ ADDED: Registers the background service with location foreground type -->
+        <service
+            android:name="id.flutter.flutter_background_service.BackgroundService"
+            android:foregroundServiceType="location"
+            android:exported="true"
+            tools:replace="android:exported" />
 
         <meta-data
             android:name="flutterEmbedding"

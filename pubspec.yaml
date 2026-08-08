@@ -28,6 +28,12 @@ dependencies:
   # Sound Player
   audioplayers: ^6.5.1
 
+  # Background Service — keeps GPS monitoring alive after app is minimized
+  flutter_background_service: ^5.0.5
+
+  # Local Notifications — persistent "Monitoring active" status bar notification
+  flutter_local_notifications: ^17.2.3
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
