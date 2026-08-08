@@ -15,6 +15,16 @@ const int notifId = 1;
 Future<void> initBackgroundService() async {
   final service = FlutterBackgroundService();
 
+  final FlutterLocalNotificationsPlugin notificationsPlugin =
+      FlutterLocalNotificationsPlugin();
+
+  // Initialize the notifications plugin (required before any notif shows)
+  await notificationsPlugin.initialize(
+    const InitializationSettings(
+      android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+    ),
+  );
+
   // Create the Android notification channel (required for Android 8+)
   const AndroidNotificationChannel channel = AndroidNotificationChannel(
     notifChannelId,
@@ -22,9 +32,6 @@ Future<void> initBackgroundService() async {
     description: 'Road Guard is actively monitoring for potholes',
     importance: Importance.low,
   );
-
-  final FlutterLocalNotificationsPlugin notificationsPlugin =
-      FlutterLocalNotificationsPlugin();
 
   await notificationsPlugin
       .resolvePlatformSpecificImplementation<

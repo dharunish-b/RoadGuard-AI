@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'screens/upload_pothole.dart';
 import 'services/background_service.dart';
 
@@ -53,6 +54,24 @@ class _HomeScreenState extends State<HomeScreen> {
   bool isRunning = false;
 
   // ===================================================
+  // INIT — sync UI with actual service state
+  // ===================================================
+
+  @override
+  void initState() {
+    super.initState();
+    _syncServiceState();
+  }
+
+  Future<void> _syncServiceState() async {
+    final service = FlutterBackgroundService();
+    final running = await service.isRunning();
+    setState(() {
+      isRunning = running;
+    });
+  }
+
+  // ===================================================
   // START / STOP BUTTON
   // ===================================================
 
@@ -60,6 +79,12 @@ class _HomeScreenState extends State<HomeScreen> {
     final service = FlutterBackgroundService();
 
     if (!isRunning) {
+      // Request notification permission at runtime (Android 13+)
+      final plugin = FlutterLocalNotificationsPlugin();
+      final android = plugin.resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin>();
+      await android?.requestNotificationsPermission();
+
       // Show battery optimization tip on first start
       _showBatteryTip();
 
