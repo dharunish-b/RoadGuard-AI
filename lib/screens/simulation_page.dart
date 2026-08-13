@@ -6,9 +6,10 @@ import '../services/alert_service.dart';
 
 // =====================================================
 // SIMULATION PAGE
-// Lets the user connect a backend URL (ngrok), pick
-// speed + weather, grab GPS, and step through 6 checks
-// of 20s each (2 min total) to demo the alert stages.
+// 6 steps × 20s = 2 minutes total.
+// Stages escalate: steps 1-2 → stage1, 3-4 → stage2, 5-6 → stage3.
+// After stage3 completes, a 3-minute "pothole passed" countdown
+// runs before the alert box resets to ALL CLEAR.
 // =====================================================
 
 class SimulationPage extends StatefulWidget {
@@ -21,6 +22,8 @@ class SimulationPage extends StatefulWidget {
 class _SimulationPageState extends State<SimulationPage> {
   // ---- Backend connect box ----
   late final TextEditingController _urlController;
+  final String _potholeId = '6a7d97d7d97b2fc1c888747c';
+
   bool _connecting = false;
 
   // ---- Config ----
@@ -34,11 +37,24 @@ class _SimulationPageState extends State<SimulationPage> {
   int _secondsRemaining = _stepDurationSec;
   Timer? _tickTimer;
 
+  // ---- Post-simulation cooldown (3 minutes = 180 seconds) ----
+  // After stage3 ends, we count down 3 min before showing ALL CLEAR.
+  // This simulates the user passing through the pothole zone.
+  static const int _cooldownDurationSec = 180;
+  int _cooldownRemaining = 0;
+  Timer? _cooldownTimer;
+  bool _inCooldown = false;
+
   // ---- State ----
   bool _running = false;
   bool _fetchingLocation = false;
   Position? _position;
   PotholeAlert? _lastAlert;
+
+  // Tracks the level that AlertService was last triggered with —
+  // used to skip re-triggering when the level hasn't changed.
+  AlertLevel _lastTriggeredLevel = AlertLevel.none;
+
   String _statusMsg = 'Configure and press Start Simulation';
   bool _backendAlive = false;
 
@@ -78,24 +94,22 @@ class _SimulationPageState extends State<SimulationPage> {
   @override
   void dispose() {
     _stopSimulation();
+    _cooldownTimer?.cancel();
     _urlController.dispose();
     super.dispose();
   }
 
   // ---------------------------------------------------
-  // BACKEND HEALTH CHECK (uses whatever is currently saved)
+  // BACKEND HEALTH CHECK
   // ---------------------------------------------------
 
   Future<void> _checkBackend() async {
     final alive = await ApiService.instance.isBackendAlive();
-    if (mounted) {
-      setState(() => _backendAlive = alive);
-    }
+    if (mounted) setState(() => _backendAlive = alive);
   }
 
   // ---------------------------------------------------
-  // CONNECT — save the typed URL (ngrok or otherwise),
-  // test it, and only keep it if it actually answers /health
+  // CONNECT
   // ---------------------------------------------------
 
   Future<void> _connectBackend() async {
@@ -107,11 +121,10 @@ class _SimulationPageState extends State<SimulationPage> {
 
     setState(() => _connecting = true);
 
-    final reachable = await ApiService.instance.isBackendAlive(overrideUrl: typed);
+    final reachable =
+        await ApiService.instance.isBackendAlive(overrideUrl: typed);
 
-    if (reachable) {
-      await ApiConfig.setBaseUrl(typed);
-    }
+    if (reachable) await ApiConfig.setBaseUrl(typed);
 
     if (mounted) {
       setState(() {
@@ -153,14 +166,14 @@ class _SimulationPageState extends State<SimulationPage> {
         }
       }
       if (permission == LocationPermission.deniedForever) {
-        _showSnack('Location permission permanently denied — enable in Settings');
+        _showSnack(
+            'Location permission permanently denied — enable in Settings');
         return null;
       }
 
-      final pos = await Geolocator.getCurrentPosition(
+      return await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
       );
-      return pos;
     } finally {
       if (mounted) setState(() => _fetchingLocation = false);
     }
@@ -168,8 +181,6 @@ class _SimulationPageState extends State<SimulationPage> {
 
   // ---------------------------------------------------
   // START SIMULATION
-  // Runs 6 steps of 20s each = 2 minutes total, then
-  // auto-completes. Each step does one backend check.
   // ---------------------------------------------------
 
   Future<void> _startSimulation() async {
@@ -178,14 +189,22 @@ class _SimulationPageState extends State<SimulationPage> {
       return;
     }
 
+    // Cancel any running cooldown before starting fresh
+    _cooldownTimer?.cancel();
+    _cooldownTimer = null;
+
     final pos = await _getLocation();
     if (pos == null) return;
 
     setState(() {
       _position = pos;
       _running = true;
+      _inCooldown = false;
+      _cooldownRemaining = 0;
       _currentStep = 0;
       _secondsRemaining = _stepDurationSec;
+      _lastAlert = null;
+      _lastTriggeredLevel = AlertLevel.none;
       _statusMsg =
           'Simulating at ${_speedKmh.toInt()} km/h · $_weather weather';
     });
@@ -193,7 +212,7 @@ class _SimulationPageState extends State<SimulationPage> {
     // Step 1 fires immediately
     await _runStep();
 
-    // 1-second UI ticker drives the 20s-per-step cadence
+    // 1-second ticker drives the 20s-per-step cadence
     _tickTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
       if (!mounted) return;
 
@@ -213,7 +232,7 @@ class _SimulationPageState extends State<SimulationPage> {
   }
 
   // ---------------------------------------------------
-  // ONE STEP = one poll to the backend
+  // ONE STEP — one backend poll
   // ---------------------------------------------------
 
   Future<void> _runStep() async {
@@ -225,31 +244,68 @@ class _SimulationPageState extends State<SimulationPage> {
     if (!mounted) return;
     setState(() {
       _statusMsg = _currentStep >= _totalSteps
-          ? 'Final step done — wrapping up…'
+          ? 'Final step done — starting cooldown…'
           : 'Step $_currentStep of $_totalSteps complete';
     });
 
     if (_currentStep >= _totalSteps) {
-      // Let the last result stay on screen for one more tick, then stop.
       await Future.delayed(const Duration(seconds: 1));
       _completeSimulation();
     }
   }
 
   // ---------------------------------------------------
-  // COMPLETE — 2 minutes / 6 steps done, auto-stop
+  // COMPLETE — simulation steps done, begin 3-min cooldown
+  //
+  // The alert box stays at STAGE 3 while the cooldown runs
+  // (because the user may still be in the pothole zone).
+  // After 3 minutes the box transitions to ALL CLEAR.
   // ---------------------------------------------------
 
   void _completeSimulation() {
     _tickTimer?.cancel();
     _tickTimer = null;
+
+    // Stop sound + torch — the hazard itself is done.
     AlertService.instance.stopAlert();
-    if (mounted) {
+
+    if (!mounted) return;
+
+    setState(() {
+      _running = false;
+      _inCooldown = true;
+      _cooldownRemaining = _cooldownDurationSec;
+      _statusMsg =
+          'Simulation complete — pothole zone clearing in ${_fmtCooldown(_cooldownRemaining)}';
+    });
+
+    // Count down 3 minutes then reset to ALL CLEAR
+    _cooldownTimer =
+        Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+
       setState(() {
-        _running = false;
-        _statusMsg = 'Simulation complete — $_totalSteps steps, 2 minutes';
+        _cooldownRemaining--;
+        _statusMsg =
+            'Pothole zone clearing in ${_fmtCooldown(_cooldownRemaining)}…';
       });
-    }
+
+      if (_cooldownRemaining <= 0) {
+        timer.cancel();
+        _cooldownTimer = null;
+        if (mounted) {
+          setState(() {
+            _inCooldown = false;
+            _lastAlert = null;          // ← box resets to ALL CLEAR green
+            _lastTriggeredLevel = AlertLevel.none;
+            _statusMsg = 'All clear — pothole zone passed';
+          });
+        }
+      }
+    });
   }
 
   // ---------------------------------------------------
@@ -259,11 +315,17 @@ class _SimulationPageState extends State<SimulationPage> {
   void _stopSimulation() {
     _tickTimer?.cancel();
     _tickTimer = null;
+    _cooldownTimer?.cancel();
+    _cooldownTimer = null;
     AlertService.instance.stopAlert();
+
     if (mounted) {
       setState(() {
         _running = false;
+        _inCooldown = false;
+        _cooldownRemaining = 0;
         _lastAlert = null;
+        _lastTriggeredLevel = AlertLevel.none;
         _statusMsg = 'Simulation stopped';
       });
     }
@@ -271,29 +333,71 @@ class _SimulationPageState extends State<SimulationPage> {
 
   // ---------------------------------------------------
   // POLL BACKEND
+  // Maps step → forced alert level client-side so the
+  // demo always escalates regardless of DB severity.
+  // Only calls AlertService.trigger() when the level
+  // actually changes — prevents siren/torch restart.
   // ---------------------------------------------------
 
   Future<void> _poll() async {
     if (_position == null) return;
 
-    final alert = await ApiService.instance.checkNearby(
-      lat: _position!.latitude,
-      lng: _position!.longitude,
-      speedKmh: _speedKmh,
-      weather: _weather,
+    final alert = await ApiService.instance.simulateStep(
+      potholeId: _potholeId,
+      step: _currentStep - 1,
+      condition: _weather,
     );
 
     if (!mounted) return;
 
-    setState(() => _lastAlert = alert);
+    // Client-side stage mapping:
+    // Steps 1-2 → stage1 (caution beep)
+    // Steps 3-4 → stage2 (medium alert + 3 torch flashes)
+    // Steps 5-6 → stage3 (siren loop + continuous torch)
+    final AlertLevel forcedLevel = switch (_currentStep) {
+      1 || 2 => AlertLevel.stage1,
+      3 || 4 => AlertLevel.stage2,
+      _      => AlertLevel.stage3,
+    };
 
-    // Trigger sound + flash
-    await AlertService.instance.trigger(alert);
+    final stagedAlert = PotholeAlert(
+      level: forcedLevel,
+      message: alert.message.isNotEmpty
+          ? alert.message
+          : _stageFallbackMessage(forcedLevel),
+      distance: alert.distance,
+      severity: alert.severity,
+      weatherNote: alert.weatherNote,
+    );
+
+    setState(() => _lastAlert = stagedAlert);
+
+    // KEY GUARD: only re-trigger sound+flash when the stage escalates.
+    // Calling trigger() again at the same level would cancel the running
+    // siren/torch and restart it, causing audible gaps and torch flicker.
+    if (forcedLevel != _lastTriggeredLevel) {
+      _lastTriggeredLevel = forcedLevel;
+      await AlertService.instance.trigger(stagedAlert);
+    }
   }
+
+  String _stageFallbackMessage(AlertLevel level) => switch (level) {
+        AlertLevel.stage1 => 'Pothole detected ahead — caution',
+        AlertLevel.stage2 => 'Pothole approaching — slow down',
+        AlertLevel.stage3 => 'SEVERE pothole — danger zone',
+        _                 => 'All clear',
+      };
 
   // ---------------------------------------------------
   // HELPERS
   // ---------------------------------------------------
+
+  /// Formats cooldown seconds as  "2:58"
+  String _fmtCooldown(int seconds) {
+    final int m = seconds ~/ 60;
+    final int s = seconds % 60;
+    return '$m:${s.toString().padLeft(2, '0')}';
+  }
 
   void _showSnack(String msg) {
     if (!mounted) return;
@@ -302,13 +406,23 @@ class _SimulationPageState extends State<SimulationPage> {
   }
 
   // ---------------------------------------------------
+  // CURRENT DISPLAY LEVEL
+  // During cooldown we keep the last stage colour so the
+  // user sees the hazard is still nearby, not yet clear.
+  // ---------------------------------------------------
+
+  AlertLevel get _displayLevel =>
+      (_inCooldown || _running)
+          ? (_lastAlert?.level ?? AlertLevel.none)
+          : (_lastAlert?.level ?? AlertLevel.none);
+
+  // ---------------------------------------------------
   // UI
   // ---------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
-    final AlertLevel currentLevel =
-        _lastAlert?.level ?? AlertLevel.none;
+    final AlertLevel currentLevel = _displayLevel;
 
     return Scaffold(
       backgroundColor: const Color(0xFF0D1117),
@@ -321,7 +435,6 @@ class _SimulationPageState extends State<SimulationPage> {
         ),
         iconTheme: const IconThemeData(color: Colors.white),
         actions: [
-          // Backend status indicator
           Padding(
             padding: const EdgeInsets.only(right: 16),
             child: Row(
@@ -365,10 +478,7 @@ class _SimulationPageState extends State<SimulationPage> {
           children: [
 
             // ==========================================
-            // BACKEND URL — CONNECT BOX
-            // Paste your ngrok URL here and hit Connect.
-            // Free ngrok URLs change on every restart, so
-            // this is intentionally editable at runtime.
+            // BACKEND URL
             // ==========================================
 
             _sectionLabel('Backend URL'),
@@ -379,7 +489,7 @@ class _SimulationPageState extends State<SimulationPage> {
                 Expanded(
                   child: TextField(
                     controller: _urlController,
-                    enabled: !_running,
+                    enabled: !_running && !_inCooldown,
                     keyboardType: TextInputType.url,
                     style: const TextStyle(color: Colors.white, fontSize: 13),
                     decoration: InputDecoration(
@@ -402,7 +512,9 @@ class _SimulationPageState extends State<SimulationPage> {
                 SizedBox(
                   height: 56,
                   child: ElevatedButton(
-                    onPressed: (_connecting || _running) ? null : _connectBackend,
+                    onPressed: (_connecting || _running || _inCooldown)
+                        ? null
+                        : _connectBackend,
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF1F6FEB),
                       foregroundColor: Colors.white,
@@ -462,7 +574,7 @@ class _SimulationPageState extends State<SimulationPage> {
             AnimatedContainer(
               duration: const Duration(milliseconds: 400),
               curve: Curves.easeOut,
-              height: 140,
+              height: _inCooldown ? 170 : 140,
               decoration: BoxDecoration(
                 color: _stageColor[currentLevel]!.withOpacity(0.15),
                 border: Border.all(
@@ -510,6 +622,35 @@ class _SimulationPageState extends State<SimulationPage> {
                       textAlign: TextAlign.center,
                     ),
                   ],
+
+                  // ---- COOLDOWN COUNTDOWN inside the pill ----
+                  if (_inCooldown) ...[
+                    const SizedBox(height: 10),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 14, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.black26,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.timer_outlined,
+                              color: Colors.white54, size: 14),
+                          const SizedBox(width: 6),
+                          Text(
+                            'Clearing in ${_fmtCooldown(_cooldownRemaining)}',
+                            style: const TextStyle(
+                              color: Colors.white54,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -530,7 +671,7 @@ class _SimulationPageState extends State<SimulationPage> {
                   child: Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 6),
                     child: GestureDetector(
-                      onTap: _running
+                      onTap: (_running || _inCooldown)
                           ? null
                           : () => setState(() => _speedKmh = speed),
                       child: AnimatedContainer(
@@ -589,10 +730,14 @@ class _SimulationPageState extends State<SimulationPage> {
               children: [
                 _weatherOption('dry', '☀️', 'Dry'),
                 _weatherOption('rain', '🌧️', 'Rain'),
-              ].map((w) => Expanded(child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 6),
-                child: w,
-              ))).toList(),
+              ]
+                  .map((w) => Expanded(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 6),
+                          child: w,
+                        ),
+                      ))
+                  .toList(),
             ),
 
             const SizedBox(height: 28),
@@ -629,7 +774,7 @@ class _SimulationPageState extends State<SimulationPage> {
             ],
 
             // ==========================================
-            // STEP / COUNTDOWN (20s per step × 6 = 2 min)
+            // STEP / COUNTDOWN PROGRESS BAR (during run)
             // ==========================================
 
             if (_running) ...[
@@ -682,6 +827,60 @@ class _SimulationPageState extends State<SimulationPage> {
             ],
 
             // ==========================================
+            // COOLDOWN PROGRESS BAR (after run, during 3-min wait)
+            // ==========================================
+
+            if (_inCooldown) ...[
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF161B22),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFF30363D)),
+                ),
+                child: Column(
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Pothole zone',
+                          style: TextStyle(
+                            color: Colors.white70,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Text(
+                          'Clears in ${_fmtCooldown(_cooldownRemaining)}',
+                          style: const TextStyle(
+                            color: Color(0xFFE74C3C),
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(6),
+                      child: LinearProgressIndicator(
+                        value: 1.0 -
+                            (_cooldownRemaining / _cooldownDurationSec),
+                        minHeight: 6,
+                        backgroundColor: const Color(0xFF21262D),
+                        valueColor: const AlwaysStoppedAnimation<Color>(
+                          Color(0xFFE74C3C),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+            ],
+
+            // ==========================================
             // STATUS TEXT
             // ==========================================
 
@@ -695,18 +894,22 @@ class _SimulationPageState extends State<SimulationPage> {
 
             // ==========================================
             // START / STOP BUTTON
+            // Disabled (but visible) during cooldown so
+            // the user can see the 3-min countdown clearly.
             // ==========================================
 
             SizedBox(
               height: 56,
               child: ElevatedButton.icon(
-                onPressed: _fetchingLocation
+                onPressed: _fetchingLocation || _inCooldown
                     ? null
                     : (_running ? _stopSimulation : _startSimulation),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: _running
-                      ? const Color(0xFFDA3633)
-                      : const Color(0xFF238636),
+                  backgroundColor: _inCooldown
+                      ? const Color(0xFF30363D)
+                      : _running
+                          ? const Color(0xFFDA3633)
+                          : const Color(0xFF238636),
                   foregroundColor: Colors.white,
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
@@ -722,11 +925,17 @@ class _SimulationPageState extends State<SimulationPage> {
                           color: Colors.white,
                         ),
                       )
-                    : Icon(_running ? Icons.stop : Icons.play_arrow),
+                    : Icon(_inCooldown
+                        ? Icons.hourglass_top
+                        : _running
+                            ? Icons.stop
+                            : Icons.play_arrow),
                 label: Text(
                   _fetchingLocation
                       ? 'Getting location…'
-                      : (_running ? 'Stop Simulation' : 'Start Simulation'),
+                      : _inCooldown
+                          ? 'Waiting — zone clears in ${_fmtCooldown(_cooldownRemaining)}'
+                          : (_running ? 'Stop Simulation' : 'Start Simulation'),
                   style: const TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.bold,
@@ -755,7 +964,9 @@ class _SimulationPageState extends State<SimulationPage> {
   Widget _weatherOption(String value, String emoji, String label) {
     final bool selected = _weather == value;
     return GestureDetector(
-      onTap: _running ? null : () => setState(() => _weather = value),
+      onTap: (_running || _inCooldown)
+          ? null
+          : () => setState(() => _weather = value),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
         padding: const EdgeInsets.symmetric(vertical: 16),

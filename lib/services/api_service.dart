@@ -3,22 +3,12 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-// =====================================================
-// CONFIG — backend URL is now RUNTIME-CONFIGURABLE
-//
-// Since the ngrok free-tier URL changes every time you
-// restart ngrok, the URL is no longer a hardcoded const.
-// It's stored in SharedPreferences under `kBaseUrlPref` and
-// can be changed from the Simulation page's "Connect" box.
-//
-// Default fallback (used until the user connects a URL):
-//   Android emulator  → http://10.0.2.2:8000
-//   Physical device via USB (adb reverse) → http://localhost:8000
-//   Physical device via ngrok → https://xxxx.ngrok-free.app
-// =====================================================
-
 const String kBaseUrlPref = 'backend_base_url';
 const String kDefaultBaseUrl = 'http://10.0.2.2:8000';
+
+const Map<String, String> kNgrokSkipHeader = {
+  'ngrok-skip-browser-warning': 'true',
+};
 
 class ApiConfig {
   static String _baseUrl = kDefaultBaseUrl;
@@ -28,10 +18,6 @@ class ApiConfig {
 
   static const Duration timeout = Duration(seconds: 15);
 
-  // ---------------------------------------------------
-  // Call once at app startup (main.dart) so the last
-  // connected ngrok URL survives an app restart.
-  // ---------------------------------------------------
   static Future<void> load() async {
     if (_loaded) return;
     final prefs = await SharedPreferences.getInstance();
@@ -42,12 +28,6 @@ class ApiConfig {
     _loaded = true;
   }
 
-  // ---------------------------------------------------
-  // Called from the Simulation page's Connect button
-  // (and by the background isolate, which loads its own
-  // copy of SharedPreferences since it can't share memory
-  // with the UI isolate).
-  // ---------------------------------------------------
   static Future<void> setBaseUrl(String url) async {
     var cleaned = url.trim();
     if (cleaned.endsWith('/')) {
@@ -61,26 +41,18 @@ class ApiConfig {
   }
 }
 
-// =====================================================
-// ALERT LEVEL — mirrors FastAPI response
-// =====================================================
-
 enum AlertLevel {
-  none,    // no pothole nearby
-  stage1,  // pothole detected, low severity  → light sound
-  stage2,  // medium severity                 → normal sound + brief flash
-  stage3,  // high severity                   → extreme sound + continuous flash
+  none,
+  stage1,
+  stage2,
+  stage3,
 }
-
-// =====================================================
-// POTHOLE NEARBY RESPONSE
-// =====================================================
 
 class PotholeAlert {
   final AlertLevel level;
   final String message;
-  final double? distance;     // metres to nearest hazard
-  final double? severity;     // 0.0 – 1.0
+  final double? distance;
+  final double? severity;
   final String? weatherNote;
 
   const PotholeAlert({
@@ -96,28 +68,30 @@ class PotholeAlert {
         message: 'All clear',
       );
 
+  // Backend (/alert) returns: { "alert": bool, "severity": "low"|"medium"|"high"|"critical", ... }
   factory PotholeAlert.fromJson(Map<String, dynamic> json) {
-    final int stage = (json['alert_stage'] as num?)?.toInt() ?? 0;
-    final AlertLevel level = switch (stage) {
-      1 => AlertLevel.stage1,
-      2 => AlertLevel.stage2,
-      3 => AlertLevel.stage3,
-      _ => AlertLevel.none,
-    };
+    final bool fires = json['alert'] as bool? ?? false;
+    final String? severityStr = json['severity'] as String?;
+
+    final AlertLevel level = !fires
+        ? AlertLevel.none
+        : switch (severityStr) {
+            'low' => AlertLevel.stage1,
+            'medium' => AlertLevel.stage2,
+            'high' => AlertLevel.stage3,
+            'critical' => AlertLevel.stage3,
+            _ => AlertLevel.none,
+          };
 
     return PotholeAlert(
       level: level,
-      message: json['message'] as String? ?? '',
+      message: json['message'] as String? ?? 'All clear',
       distance: (json['distance_m'] as num?)?.toDouble(),
-      severity: (json['severity'] as num?)?.toDouble(),
-      weatherNote: json['weather_note'] as String?,
+      severity: null,
+      weatherNote: null,
     );
   }
 }
-
-// =====================================================
-// UPLOAD RESPONSE
-// =====================================================
 
 class UploadResult {
   final bool success;
@@ -134,13 +108,29 @@ class UploadResult {
     this.detectionLabel,
   });
 
+  // Backend (/upload) returns: { "detections": n, "results": [ {severity, fall_type, confidence, ...} ] }
   factory UploadResult.fromJson(Map<String, dynamic> json) {
+    final int detections = (json['detections'] as num?)?.toInt() ?? 0;
+    final List results = json['results'] as List? ?? [];
+    final Map<String, dynamic>? first =
+        results.isNotEmpty ? results.first as Map<String, dynamic> : null;
+
+    final String? severityStr = first?['severity'] as String?;
+    final AlertLevel level = switch (severityStr) {
+      'low' => AlertLevel.stage1,
+      'medium' => AlertLevel.stage2,
+      'high' || 'critical' => AlertLevel.stage3,
+      _ => AlertLevel.none,
+    };
+
     return UploadResult(
-      success: json['success'] as bool? ?? false,
-      message: json['message'] as String? ?? '',
-      alertStage: (json['alert_stage'] as num?)?.toInt(),
-      severity: (json['severity'] as num?)?.toDouble(),
-      detectionLabel: json['label'] as String?,
+      success: detections > 0,
+      message: detections > 0
+          ? 'Pothole detected and saved'
+          : 'No pothole detected in image',
+      alertStage: level == AlertLevel.none ? null : level.index,
+      severity: (first?['confidence'] as num?)?.toDouble(),
+      detectionLabel: first?['fall_type'] as String?,
     );
   }
 
@@ -148,20 +138,11 @@ class UploadResult {
       UploadResult(success: false, message: msg);
 }
 
-// =====================================================
-// API SERVICE
-// =====================================================
-
 class ApiService {
   ApiService._();
   static final ApiService instance = ApiService._();
 
-  // ---------------------------------------------------
-  // CHECK NEARBY POTHOLES (used by background service + simulation)
-  // POST /api/check-nearby
-  // Body: { "lat": ..., "lng": ..., "speed_kmh": ..., "weather": ... }
-  // ---------------------------------------------------
-
+  // GET /alert?lat=..&lon=..&speed_kmh=..
   Future<PotholeAlert> checkNearby({
     required double lat,
     required double lng,
@@ -169,19 +150,16 @@ class ApiService {
     String weather = 'dry',
   }) async {
     try {
-      final uri = Uri.parse('${ApiConfig.baseUrl}/api/check-nearby');
+      final uri = Uri.parse('${ApiConfig.baseUrl}/alert').replace(
+        queryParameters: {
+          'lat': lat.toString(),
+          'lon': lng.toString(),
+          'speed_kmh': speedKmh.toString(),
+        },
+      );
 
       final response = await http
-          .post(
-            uri,
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'lat': lat,
-              'lng': lng,
-              'speed_kmh': speedKmh,
-              'weather': weather,
-            }),
-          )
+          .get(uri, headers: kNgrokSkipHeader)
           .timeout(ApiConfig.timeout);
 
       if (response.statusCode == 200) {
@@ -191,30 +169,53 @@ class ApiService {
         return PotholeAlert.none();
       }
     } on SocketException {
-      // Backend unreachable — silent fail, don't crash the service
       return PotholeAlert.none();
     } catch (_) {
       return PotholeAlert.none();
     }
   }
+  Future<PotholeAlert> simulateStep({
+  required String potholeId,
+  required int step,
+  required String condition,
+}) async {
+  try {
+    final uri = Uri.parse('${ApiConfig.baseUrl}/simulate/step').replace(
+      queryParameters: {
+        'pothole_id': potholeId,
+        'step': step.toString(),
+        'condition': condition,
+      },
+    );
 
-  // ---------------------------------------------------
-  // UPLOAD POTHOLE IMAGE
-  // POST /api/upload
-  // Multipart: image file + lat + lng
-  // ---------------------------------------------------
+    final response = await http
+        .get(uri, headers: kNgrokSkipHeader)
+        .timeout(ApiConfig.timeout);
 
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      return PotholeAlert.fromJson(data);
+    }
+
+    return PotholeAlert.none();
+  } catch (_) {
+    return PotholeAlert.none();
+  }
+}
+
+  // POST /upload  (multipart: image, lat, lon, speed_kmh)
   Future<UploadResult> uploadPothole({
     required File imageFile,
     required double lat,
     required double lng,
   }) async {
     try {
-      final uri = Uri.parse('${ApiConfig.baseUrl}/api/upload');
+      final uri = Uri.parse('${ApiConfig.baseUrl}/upload');
 
       final request = http.MultipartRequest('POST', uri)
+        ..headers.addAll(kNgrokSkipHeader)
         ..fields['lat'] = lat.toString()
-        ..fields['lng'] = lng.toString()
+        ..fields['lon'] = lng.toString()
         ..files.add(
           await http.MultipartFile.fromPath('image', imageFile.path),
         );
@@ -241,16 +242,14 @@ class ApiService {
     }
   }
 
-  // ---------------------------------------------------
-  // HEALTH CHECK — test if backend is reachable
   // GET /health
-  // ---------------------------------------------------
-
   Future<bool> isBackendAlive({String? overrideUrl}) async {
     try {
       final base = overrideUrl ?? ApiConfig.baseUrl;
       final uri = Uri.parse('$base/health');
-      final response = await http.get(uri).timeout(const Duration(seconds: 5));
+      final response = await http
+          .get(uri, headers: kNgrokSkipHeader)
+          .timeout(const Duration(seconds: 5));
       return response.statusCode == 200;
     } catch (_) {
       return false;

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:geolocator/geolocator.dart';
 import 'screens/upload_pothole.dart';
 import 'screens/simulation_page.dart';
 import 'services/background_service.dart';
@@ -100,6 +101,50 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ===================================================
+  // LOCATION GATE — runs on every tap of START, independent
+  // of the Simulation page (which has its own copy of this
+  // logic and is never touched by this code).
+  // Returns true only if location service is ON and permission
+  // is granted; otherwise shows a snack and returns false.
+  // ===================================================
+
+  Future<bool> _ensureLocationReady() async {
+    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Please enable Location to start monitoring'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+      // Opens the device location settings screen so the user can
+      // flip it on themselves — apps cannot toggle it programmatically.
+      await Geolocator.openLocationSettings();
+      return false;
+    }
+
+    LocationPermission perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+    }
+    if (perm == LocationPermission.denied ||
+        perm == LocationPermission.deniedForever) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Location permission required to start monitoring'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+      return false;
+    }
+    return true;
+  }
+
+  // ===================================================
   // TOGGLE MONITORING
   // ===================================================
 
@@ -107,30 +152,38 @@ class _HomeScreenState extends State<HomeScreen> {
     final service = FlutterBackgroundService();
 
     if (!isRunning) {
-      // Make sure the backend is actually reachable before we start
-      // burning battery polling it in the background.
+      // Ask location EVERY time START is tapped.
+      final locationReady = await _ensureLocationReady();
+      if (!locationReady) return;
+
+      // Make sure the backend is actually reachable — but don't block
+      // START on it. If unreachable, warn only; monitoring still starts
+      // and will just keep retrying once a URL is reachable.
       final alive = await ApiService.instance.isBackendAlive();
-      if (!alive) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                'Cannot reach backend at ${ApiConfig.baseUrl}. '
-                'Connect a valid URL from the Simulation page first.',
-              ),
-              duration: const Duration(seconds: 3),
+      if (!alive && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Warning: cannot reach backend at ${ApiConfig.baseUrl}. '
+              'Monitoring will start anyway.',
             ),
-          );
-        }
-        return;
+            duration: const Duration(seconds: 3),
+          ),
+        );
       }
 
       final plugin = FlutterLocalNotificationsPlugin();
-      final android = plugin.resolvePlatformSpecificImplementation<
-          AndroidFlutterLocalNotificationsPlugin>();
+      final android = plugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
       await android?.requestNotificationsPermission();
 
       _showBatteryTip();
+
+      // FIX: mark this as a real, user-initiated start BEFORE calling
+      // startService(). Without this, onServiceStart() in the background
+      // isolate always thinks Android silently relaunched it (its
+      // consent-gate check), fires the "Resume monitoring?" notification
+      // every single time, and stops itself — monitoring never actually runs.
+      await markExplicitStart();
       await service.startService();
 
       // Give the background isolate its base_url + default config.
@@ -144,6 +197,9 @@ class _HomeScreenState extends State<HomeScreen> {
     } else {
       service.invoke('stop');
       await AlertService.instance.stopAlert();
+      // App-side location usage ends here — background isolate's GPS
+      // polling timer stops with the service, so no further location
+      // reads happen until START is tapped again.
     }
 
     final nowRunning = !isRunning;

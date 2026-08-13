@@ -1,99 +1,144 @@
 import 'dart:async';
+
 import 'package:audioplayers/audioplayers.dart';
 import 'package:torch_light/torch_light.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'api_service.dart';
 
-// =====================================================
-// ALERT SERVICE
-// Manages the 3 alert stages for pothole proximity
-//
-// Stage 1 — light beep                   (sound only)
-// Stage 2 — normal alert + brief flash   (sound + 3 flashes)
-// Stage 3 — extreme alarm + cont. flash  (sound + continuous flash)
-//
-// All methods are safe to call from main or background isolate.
-// =====================================================
+import 'api_service.dart';
 
 class AlertService {
   AlertService._();
   static final AlertService instance = AlertService._();
 
   final AudioPlayer _player = AudioPlayer();
+
   Timer? _flashTimer;
   bool _torchOn = false;
 
-  // ---------------------------------------------------
+  // =====================================================
   // PUBLIC ENTRY POINT
-  // Call this whenever you receive a PotholeAlert
-  // ---------------------------------------------------
+  // =====================================================
 
   Future<void> trigger(PotholeAlert alert) async {
-    // Always cancel any running flash loop first
+    print(
+      '[AlertService] trigger: '
+      'level=${alert.level}, '
+      'message=${alert.message}',
+    );
+
+    // Stop anything from the previous alert first.
     await _cancelFlash();
+    await _player.stop();
+
+    // Always reset looping before a new alert.
+    await _player.setReleaseMode(ReleaseMode.release);
 
     switch (alert.level) {
       case AlertLevel.none:
-        // Nothing
+        print('[AlertService] ALL CLEAR');
         break;
+
       case AlertLevel.stage1:
+        print('[AlertService] STAGE 1');
         await _stage1();
         break;
+
       case AlertLevel.stage2:
+        print('[AlertService] STAGE 2');
         await _stage2();
         break;
+
       case AlertLevel.stage3:
+        print('[AlertService] STAGE 3');
         await _stage3();
         break;
     }
   }
 
-  // ---------------------------------------------------
-  // STAGE 1 — single soft beep
-  // ---------------------------------------------------
+  // =====================================================
+  // STAGE 1
+  // =====================================================
 
   Future<void> _stage1() async {
     try {
-      // Uses a short 440 Hz beep asset (add to assets/sounds/beep_soft.mp3)
-      await _player.setVolume(0.5);
-      await _player.play(AssetSource('sounds/beep_soft.mp3'));
-    } catch (_) {
-      // Asset may not exist in dev — silent fail
+      await _player.stop();
+
+      await _player.setReleaseMode(ReleaseMode.release);
+      await _player.setVolume(1.0);
+
+      print('[AlertService] Playing Stage 1 sound');
+
+      await _player.play(
+        AssetSource('sounds/beep_soft.mp3'),
+      );
+
+      print('[AlertService] Stage 1 sound started');
+    } catch (e) {
+      print('[AlertService] STAGE 1 AUDIO ERROR: $e');
     }
   }
 
-  // ---------------------------------------------------
-  // STAGE 2 — medium alert + 3 short flashes
-  // ---------------------------------------------------
+  // =====================================================
+  // STAGE 2
+  // =====================================================
 
   Future<void> _stage2() async {
     try {
-      await _player.setVolume(0.85);
-      await _player.play(AssetSource('sounds/alert_medium.mp3'));
-    } catch (_) {}
+      await _player.stop();
+
+      await _player.setReleaseMode(ReleaseMode.release);
+      await _player.setVolume(1.0);
+
+      print('[AlertService] Playing Stage 2 sound');
+
+      await _player.play(
+        AssetSource('sounds/alert_medium.mp3'),
+      );
+
+      print('[AlertService] Stage 2 sound started');
+    } catch (e) {
+      print('[AlertService] STAGE 2 AUDIO ERROR: $e');
+    }
 
     // 3 quick flashes
     for (int i = 0; i < 3; i++) {
       await _flashOn();
-      await Future.delayed(const Duration(milliseconds: 150));
+
+      await Future.delayed(
+        const Duration(milliseconds: 150),
+      );
+
       await _flashOff();
-      await Future.delayed(const Duration(milliseconds: 150));
+
+      await Future.delayed(
+        const Duration(milliseconds: 150),
+      );
     }
   }
 
-  // ---------------------------------------------------
-  // STAGE 3 — loud siren + continuous flash
-  // Flash runs until stopAlert() is called or a new trigger comes in
-  // ---------------------------------------------------
+  // =====================================================
+  // STAGE 3
+  // =====================================================
 
   Future<void> _stage3() async {
     try {
+      await _player.stop();
+
       await _player.setVolume(1.0);
       await _player.setReleaseMode(ReleaseMode.loop);
-      await _player.play(AssetSource('sounds/siren.mp3'));
-    } catch (_) {}
 
-    // Continuous flash — 200ms on / 200ms off
+      print('[AlertService] Playing Stage 3 siren');
+
+      await _player.play(
+        AssetSource('sounds/siren.mp3'),
+      );
+
+      print('[AlertService] Stage 3 siren started');
+    } catch (e) {
+      print('[AlertService] STAGE 3 AUDIO ERROR: $e');
+    }
+
+    // Continuous flashlight.
     _flashTimer = Timer.periodic(
       const Duration(milliseconds: 200),
       (_) async {
@@ -106,73 +151,95 @@ class AlertService {
     );
   }
 
-  // ---------------------------------------------------
-  // STOP — call when alert clears or app goes to background
-  // ---------------------------------------------------
+  // =====================================================
+  // STOP ALERT
+  // =====================================================
 
   Future<void> stopAlert() async {
+    print('[AlertService] stopAlert');
+
     await _cancelFlash();
-    await _player.stop();
-    await _player.setReleaseMode(ReleaseMode.release);
+
+    try {
+      await _player.stop();
+      await _player.setReleaseMode(ReleaseMode.release);
+    } catch (e) {
+      print('[AlertService] stop audio error: $e');
+    }
   }
 
-  // ---------------------------------------------------
-  // FLASH HELPERS
-  // ---------------------------------------------------
+  // =====================================================
+  // FLASH
+  // =====================================================
 
   Future<void> _flashOn() async {
     try {
       await TorchLight.enableTorch();
       _torchOn = true;
-    } catch (_) {}
+    } catch (e) {
+      print('[AlertService] Torch ON error: $e');
+    }
   }
 
   Future<void> _flashOff() async {
     try {
       await TorchLight.disableTorch();
       _torchOn = false;
-    } catch (_) {}
+    } catch (e) {
+      print('[AlertService] Torch OFF error: $e');
+    }
   }
 
   Future<void> _cancelFlash() async {
     _flashTimer?.cancel();
     _flashTimer = null;
-    await _flashOff();
+
+    if (_torchOn) {
+      await _flashOff();
+    }
   }
 
-  // ---------------------------------------------------
+  // =====================================================
   // DISPOSE
-  // ---------------------------------------------------
+  // =====================================================
 
-  void dispose() {
+  Future<void> dispose() async {
     _flashTimer?.cancel();
-    _player.dispose();
+    _flashTimer = null;
+
+    await _player.stop();
+    await _player.dispose();
   }
 }
 
+
 // =====================================================
-// NOTIFICATION HELPER — used by background service
-// Shows a heads-up notification for stage 2 / 3
+// NOTIFICATION HELPER
 // =====================================================
 
 class AlertNotificationHelper {
   static final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
 
-  static Future<void> showHazardNotification(PotholeAlert alert) async {
-    if (alert.level == AlertLevel.none || alert.level == AlertLevel.stage1) {
-      return; // Stage 1 is sound-only, no notification needed
+  static Future<void> showHazardNotification(
+    PotholeAlert alert,
+  ) async {
+    if (alert.level == AlertLevel.none ||
+        alert.level == AlertLevel.stage1) {
+      return;
     }
 
-    final String title = alert.level == AlertLevel.stage3
-        ? '⚠️ SEVERE POTHOLE AHEAD'
-        : '⚠️ Pothole Warning';
+    final String title =
+        alert.level == AlertLevel.stage3
+            ? '⚠️ SEVERE POTHOLE AHEAD'
+            : '⚠️ Pothole Warning';
 
     final String body = [
       alert.message,
       if (alert.distance != null)
         '${alert.distance!.toStringAsFixed(0)} m ahead',
-      if (alert.weatherNote != null) alert.weatherNote!,
+      if (alert.weatherNote != null)
+        alert.weatherNote!,
     ].join(' · ');
 
     await _plugin.show(
@@ -183,13 +250,15 @@ class AlertNotificationHelper {
         android: AndroidNotificationDetails(
           'road_guard_alerts',
           'Hazard Alerts',
-          channelDescription: 'Pothole and road hazard warnings',
-          importance: alert.level == AlertLevel.stage3
-              ? Importance.max
-              : Importance.high,
+          channelDescription:
+              'Pothole and road hazard warnings',
+          importance:
+              alert.level == AlertLevel.stage3
+                  ? Importance.max
+                  : Importance.high,
           priority: Priority.high,
           enableVibration: true,
-          playSound: false, // AudioPlayer handles sound
+          playSound: false,
         ),
       ),
     );
