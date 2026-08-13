@@ -2,7 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'screens/upload_pothole.dart';
+import 'screens/simulation_page.dart';
 import 'services/background_service.dart';
+import 'services/alert_service.dart';
+import 'services/api_service.dart';
 
 // =====================================================
 // MAIN
@@ -10,12 +13,13 @@ import 'services/background_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await ApiConfig.load(); // restore last-connected ngrok URL, if any
   await initBackgroundService();
   runApp(const RoadGuardApp());
 }
 
 // =====================================================
-// ROADGUARD APP
+// APP
 // =====================================================
 
 class RoadGuardApp extends StatelessWidget {
@@ -26,11 +30,15 @@ class RoadGuardApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Road Guard AI',
-
       theme: ThemeData(
         primarySwatch: Colors.blue,
+        scaffoldBackgroundColor: const Color(0xFF0D1117),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFF161B22),
+          foregroundColor: Colors.white,
+          elevation: 0,
+        ),
       ),
-
       home: const HomeScreen(),
     );
   }
@@ -48,86 +56,134 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-
-  // false = STOPPED  →  green START button
-  // true  = RUNNING  →  red STOP button
   bool isRunning = false;
 
   // ===================================================
-  // INIT — sync UI with actual service state
+  // INIT
   // ===================================================
 
   @override
   void initState() {
     super.initState();
     _syncServiceState();
+    _listenToAlerts();
   }
 
   Future<void> _syncServiceState() async {
     final service = FlutterBackgroundService();
     final running = await service.isRunning();
-    setState(() {
-      isRunning = running;
+    if (mounted) setState(() => isRunning = running);
+  }
+
+  // ===================================================
+  // LISTEN TO ALERTS FROM BACKGROUND SERVICE
+  // When the app is open, the service streams alert
+  // events — we trigger sound + flash here in the main isolate
+  // ===================================================
+
+  void _listenToAlerts() {
+    final service = FlutterBackgroundService();
+    service.on('alert').listen((data) async {
+      if (data == null) return;
+      final int levelIndex = (data['level'] as num?)?.toInt() ?? 0;
+      final AlertLevel level = AlertLevel.values[levelIndex];
+
+      final alert = PotholeAlert(
+        level: level,
+        message: data['message'] as String? ?? '',
+        distance: (data['distance'] as num?)?.toDouble(),
+        severity: (data['severity'] as num?)?.toDouble(),
+      );
+
+      await AlertService.instance.trigger(alert);
     });
   }
 
   // ===================================================
-  // START / STOP BUTTON
+  // TOGGLE MONITORING
   // ===================================================
 
   void toggleMonitoring() async {
     final service = FlutterBackgroundService();
 
     if (!isRunning) {
-      // Request notification permission at runtime (Android 13+)
+      // Make sure the backend is actually reachable before we start
+      // burning battery polling it in the background.
+      final alive = await ApiService.instance.isBackendAlive();
+      if (!alive) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                'Cannot reach backend at ${ApiConfig.baseUrl}. '
+                'Connect a valid URL from the Simulation page first.',
+              ),
+              duration: const Duration(seconds: 3),
+            ),
+          );
+        }
+        return;
+      }
+
       final plugin = FlutterLocalNotificationsPlugin();
       final android = plugin.resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin>();
       await android?.requestNotificationsPermission();
 
-      // Show battery optimization tip on first start
       _showBatteryTip();
-
       await service.startService();
+
+      // Give the background isolate its base_url + default config.
+      // (It also re-reads the URL from SharedPreferences on every poll,
+      // this just avoids a cold-start race.)
+      service.invoke('config', {
+        'speed_kmh': 30.0,
+        'weather': 'dry',
+        'base_url': ApiConfig.baseUrl,
+      });
     } else {
       service.invoke('stop');
+      await AlertService.instance.stopAlert();
     }
 
-    setState(() {
-      isRunning = !isRunning;
-    });
+    final nowRunning = !isRunning;
+    setState(() => isRunning = nowRunning);
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          isRunning
-              ? "Monitoring Started"
-              : "Monitoring Stopped",
+    // Persist state so boot handler knows user's intent
+    await saveMonitoringState(nowRunning);
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            nowRunning ? 'Monitoring Started' : 'Monitoring Stopped',
+          ),
+          duration: const Duration(seconds: 1),
         ),
-        duration: const Duration(seconds: 1),
-      ),
-    );
+      );
+    }
   }
-
-  // ===================================================
-  // BATTERY TIP DIALOG
-  // ===================================================
 
   void _showBatteryTip() {
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
-        title: const Text("Keep Road Guard Running"),
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text(
+          'Keep Road Guard Running',
+          style: TextStyle(color: Colors.white),
+        ),
         content: const Text(
-          "For uninterrupted monitoring, go to:\n\n"
-          "Settings → Battery → Road Guard AI\n"
-          "→ Set to 'Unrestricted' or 'No restrictions'\n\n"
-          "This ensures the app keeps monitoring even when minimized.",
+          'For uninterrupted monitoring:\n\n'
+          'Settings → Battery → Road Guard AI\n'
+          '→ Set to "Unrestricted"\n\n'
+          'This keeps monitoring active when minimized.',
+          style: TextStyle(color: Colors.white70),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
-            child: const Text("Got it"),
+            child: const Text('Got it'),
           ),
         ],
       ),
@@ -141,6 +197,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFF0D1117),
 
       // =================================================
       // APP BAR
@@ -148,10 +205,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
       appBar: AppBar(
         title: const Text(
-          "Road Guard AI",
-          style: TextStyle(
-            fontWeight: FontWeight.bold,
-          ),
+          'Road Guard AI',
+          style: TextStyle(fontWeight: FontWeight.bold),
         ),
       ),
 
@@ -160,77 +215,54 @@ class _HomeScreenState extends State<HomeScreen> {
       // =================================================
 
       drawer: Drawer(
+        backgroundColor: const Color(0xFF161B22),
         child: ListView(
           padding: EdgeInsets.zero,
           children: [
 
-            // -------------------------------------------
-            // DRAWER HEADER
-            // -------------------------------------------
-
             const DrawerHeader(
-              decoration: BoxDecoration(
-                color: Colors.blue,
-              ),
-
+              decoration: BoxDecoration(color: Color(0xFF1F6FEB)),
               child: Center(
                 child: Text(
-                  "Road Guard AI",
+                  'Road Guard AI',
                   style: TextStyle(
                     color: Colors.white,
-                    fontSize: 28,
+                    fontSize: 26,
                     fontWeight: FontWeight.bold,
                   ),
                 ),
               ),
             ),
 
-            // -------------------------------------------
-            // HOME
-            // -------------------------------------------
-
-            ListTile(
-              leading: const Icon(Icons.home),
-              title: const Text("Home"),
-
-              onTap: () {
-                Navigator.pop(context);
-              },
+            _drawerItem(
+              icon: Icons.home,
+              label: 'Home',
+              onTap: () => Navigator.pop(context),
             ),
 
-            // -------------------------------------------
-            // SIMULATION
-            // -------------------------------------------
-
-            ListTile(
-              leading: const Icon(Icons.science),
-              title: const Text("Simulation"),
-
+            _drawerItem(
+              icon: Icons.science,
+              label: 'Simulation',
               onTap: () {
                 Navigator.pop(context);
-
-                // Simulation page can be added later.
-              },
-            ),
-
-            // -------------------------------------------
-            // UPLOAD POT HOLE
-            // -------------------------------------------
-
-            ListTile(
-              leading: const Icon(Icons.upload),
-              title: const Text("Upload Pot Hole"),
-
-              onTap: () {
-
-                Navigator.pop(context);
-
                 Navigator.push(
                   context,
-
                   MaterialPageRoute(
-                    builder: (context) =>
-                        const UploadPotholePage(),
+                    builder: (_) => const SimulationPage(),
+                  ),
+                );
+              },
+            ),
+
+            _drawerItem(
+              icon: Icons.upload,
+              label: 'Upload Pot Hole',
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => const UploadPotholePage(),
                   ),
                 );
               },
@@ -240,86 +272,55 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
 
       // =================================================
-      // HOME BODY
+      // BODY
       // =================================================
 
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
-
           children: [
 
-            // -------------------------------------------
-            // TITLE
-            // -------------------------------------------
-
             const Text(
-              "Road Guard AI",
-
+              'Road Guard AI',
               style: TextStyle(
                 fontSize: 34,
                 fontWeight: FontWeight.bold,
+                color: Colors.white,
               ),
             ),
 
             const SizedBox(height: 15),
 
-            // -------------------------------------------
-            // STATUS TEXT
-            // -------------------------------------------
-
             Text(
               isRunning
-                  ? "Monitoring is active"
-                  : "Tap START to begin monitoring",
-
+                  ? 'Monitoring is active'
+                  : 'Tap START to begin monitoring',
               style: TextStyle(
                 fontSize: 18,
                 color: isRunning
-                    ? Colors.green
-                    : Colors.grey,
+                    ? const Color(0xFF2ECC71)
+                    : Colors.white38,
               ),
             ),
 
             const SizedBox(height: 50),
 
-            // -------------------------------------------
-            // ROUND START / STOP BUTTON
-            // -------------------------------------------
-
+            // Round START / STOP button
             SizedBox(
               width: 180,
               height: 180,
-
               child: ElevatedButton(
-
                 onPressed: toggleMonitoring,
-
                 style: ElevatedButton.styleFrom(
-
-                  // STOPPED = GREEN (tap to START)
-                  // RUNNING = RED   (tap to STOP)
                   backgroundColor:
-                      isRunning
-                          ? Colors.red
-                          : Colors.green,
-
+                      isRunning ? const Color(0xFFDA3633) : const Color(0xFF238636),
                   foregroundColor: Colors.white,
-
-                  // ROUND BUTTON
                   shape: const CircleBorder(),
-
                   elevation: 8,
-
                   padding: EdgeInsets.zero,
                 ),
-
                 child: Text(
-
-                  isRunning
-                      ? "STOP"
-                      : "START",
-
+                  isRunning ? 'STOP' : 'START',
                   style: const TextStyle(
                     fontSize: 28,
                     fontWeight: FontWeight.bold,
@@ -330,23 +331,27 @@ class _HomeScreenState extends State<HomeScreen> {
 
             const SizedBox(height: 40),
 
-            // -------------------------------------------
-            // SMALL INSTRUCTION
-            // -------------------------------------------
-
             Text(
               isRunning
-                  ? "Tap to stop monitoring"
-                  : "Tap START to monitor roads",
-
-              style: const TextStyle(
-                fontSize: 16,
-                color: Colors.grey,
-              ),
+                  ? 'Tap to stop monitoring'
+                  : 'Tap START to monitor roads',
+              style: const TextStyle(fontSize: 16, color: Colors.white38),
             ),
           ],
         ),
       ),
+    );
+  }
+
+  Widget _drawerItem({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return ListTile(
+      leading: Icon(icon, color: Colors.white70),
+      title: Text(label, style: const TextStyle(color: Colors.white)),
+      onTap: onTap,
     );
   }
 }

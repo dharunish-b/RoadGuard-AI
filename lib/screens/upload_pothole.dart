@@ -1,355 +1,362 @@
 import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:geolocator/geolocator.dart';
+import '../services/api_service.dart';
 
 class UploadPotholePage extends StatefulWidget {
   const UploadPotholePage({super.key});
 
   @override
-  State<UploadPotholePage> createState() =>
-      _UploadPotholePageState();
+  State<UploadPotholePage> createState() => _UploadPotholePageState();
 }
 
-class _UploadPotholePageState
-    extends State<UploadPotholePage> {
-
+class _UploadPotholePageState extends State<UploadPotholePage> {
   File? image;
+  final latController = TextEditingController();
+  final lngController = TextEditingController();
+  final ImagePicker _picker = ImagePicker();
 
-  final latitudeController =
-      TextEditingController();
+  bool _uploading = false;
+  UploadResult? _lastResult;
 
-  final longitudeController =
-      TextEditingController();
-
-  final ImagePicker picker = ImagePicker();
-
-  // ---------------- PICK IMAGE ----------------
+  // ---------------------------------------------------
+  // PICK IMAGE
+  // ---------------------------------------------------
 
   Future<void> pickImage() async {
-
-    final XFile? pickedImage =
-        await picker.pickImage(
+    final XFile? picked = await _picker.pickImage(
       source: ImageSource.gallery,
+      imageQuality: 85,
     );
-
-    if (pickedImage != null) {
-
+    if (picked != null) {
       setState(() {
-        image = File(pickedImage.path);
+        image = File(picked.path);
+        _lastResult = null;
       });
     }
   }
 
-  // ---------------- GET LOCATION ----------------
+  // ---------------------------------------------------
+  // GET LOCATION
+  // ---------------------------------------------------
 
   Future<void> getLocation() async {
-
-    bool serviceEnabled =
-        await Geolocator.isLocationServiceEnabled();
-
-    if (!serviceEnabled) {
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            "Please enable Location on your phone",
-          ),
-        ),
-      );
-
+    bool enabled = await Geolocator.isLocationServiceEnabled();
+    if (!enabled) {
+      _snack('Please enable Location on your device');
       return;
     }
 
-    LocationPermission permission =
-        await Geolocator.checkPermission();
-
-    if (permission ==
-        LocationPermission.denied) {
-
-      permission =
-          await Geolocator.requestPermission();
-
-      if (permission ==
-          LocationPermission.denied) {
-
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              "Location permission denied",
-            ),
-          ),
-        );
-
+    LocationPermission perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+      if (perm == LocationPermission.denied) {
+        _snack('Location permission denied');
         return;
       }
     }
-
-    if (permission ==
-        LocationPermission.deniedForever) {
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            "Location permission permanently denied",
-          ),
-        ),
-      );
-
+    if (perm == LocationPermission.deniedForever) {
+      _snack('Location permission permanently denied');
       return;
     }
 
-    Position position =
-        await Geolocator.getCurrentPosition();
-
+    final pos = await Geolocator.getCurrentPosition();
     setState(() {
-
-      latitudeController.text =
-          position.latitude.toString();
-
-      longitudeController.text =
-          position.longitude.toString();
+      latController.text = pos.latitude.toString();
+      lngController.text = pos.longitude.toString();
     });
   }
 
-  // ---------------- DISPOSE ----------------
+  // ---------------------------------------------------
+  // SUBMIT — calls FastAPI /api/upload
+  // ---------------------------------------------------
+
+  Future<void> _submit() async {
+    if (image == null) {
+      _snack('Please select a pothole image');
+      return;
+    }
+    final lat = double.tryParse(latController.text);
+    final lng = double.tryParse(lngController.text);
+    if (lat == null || lng == null) {
+      _snack('Please enter valid latitude and longitude');
+      return;
+    }
+
+    setState(() {
+      _uploading = true;
+      _lastResult = null;
+    });
+
+    final result = await ApiService.instance.uploadPothole(
+      imageFile: image!,
+      lat: lat,
+      lng: lng,
+    );
+
+    if (mounted) {
+      setState(() {
+        _uploading = false;
+        _lastResult = result;
+      });
+    }
+  }
+
+  void _snack(String msg) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(msg)));
+  }
 
   @override
   void dispose() {
-
-    latitudeController.dispose();
-    longitudeController.dispose();
-
+    latController.dispose();
+    lngController.dispose();
     super.dispose();
   }
 
-  // ---------------- UI ----------------
+  // ---------------------------------------------------
+  // UI
+  // ---------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
-
     return Scaffold(
-
+      backgroundColor: const Color(0xFF0D1117),
       appBar: AppBar(
-        title: const Text(
-          "Upload Pot Hole",
-        ),
+        title: const Text('Upload Pothole'),
       ),
-
       body: SingleChildScrollView(
-
         padding: const EdgeInsets.all(20),
-
         child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
 
             // IMAGE AREA
-
-            image == null
-
-                ? Container(
-                    height: 220,
-                    width: double.infinity,
-
-                    decoration: BoxDecoration(
-                      border: Border.all(
-                        color: Colors.grey,
-                      ),
-                      borderRadius:
-                          BorderRadius.circular(10),
-                    ),
-
-                    child: const Center(
-                      child: Text(
-                        "No Image Selected",
-                      ),
-                    ),
-                  )
-
-                : ClipRRect(
-                    borderRadius:
-                        BorderRadius.circular(10),
-
-                    child: Image.file(
-                      image!,
-                      height: 220,
-                      width: double.infinity,
-                      fit: BoxFit.cover,
-                    ),
+            GestureDetector(
+              onTap: pickImage,
+              child: Container(
+                height: 220,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF161B22),
+                  border: Border.all(
+                    color: image != null
+                        ? const Color(0xFF238636)
+                        : const Color(0xFF30363D),
                   ),
-
-            const SizedBox(height: 20),
-
-            // UPLOAD PHOTO
-
-            SizedBox(
-              width: double.infinity,
-
-              child: ElevatedButton.icon(
-
-                onPressed: pickImage,
-
-                icon: const Icon(
-                  Icons.photo,
+                  borderRadius: BorderRadius.circular(12),
                 ),
-
-                label: const Text(
-                  "Upload Photo",
-                ),
+                child: image == null
+                    ? const Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.add_photo_alternate_outlined,
+                              size: 48, color: Colors.white38),
+                          SizedBox(height: 8),
+                          Text('Tap to select image',
+                              style: TextStyle(color: Colors.white38)),
+                        ],
+                      )
+                    : ClipRRect(
+                        borderRadius: BorderRadius.circular(11),
+                        child: Image.file(image!,
+                            fit: BoxFit.cover, width: double.infinity),
+                      ),
               ),
             ),
 
-            const SizedBox(height: 30),
+            const SizedBox(height: 16),
+
+            // UPLOAD PHOTO BUTTON
+            OutlinedButton.icon(
+              onPressed: pickImage,
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.white70,
+                side: const BorderSide(color: Color(0xFF30363D)),
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              icon: const Icon(Icons.photo),
+              label: const Text('Choose from Gallery'),
+            ),
+
+            const SizedBox(height: 28),
 
             // LATITUDE
-
-            TextField(
-
-              controller: latitudeController,
-
-              keyboardType:
-                  const TextInputType.numberWithOptions(
-                decimal: true,
-                signed: true,
-              ),
-
-              decoration:
-                  const InputDecoration(
-
-                border:
-                    OutlineInputBorder(),
-
-                labelText: "Latitude",
-
-                hintText:
-                    "Enter latitude",
-
-                prefixIcon: Icon(
-                  Icons.location_on,
-                ),
-              ),
+            _textField(
+              controller: latController,
+              label: 'Latitude',
+              hint: 'e.g. 9.9252',
             ),
 
-            const SizedBox(height: 20),
+            const SizedBox(height: 16),
 
             // LONGITUDE
-
-            TextField(
-
-              controller:
-                  longitudeController,
-
-              keyboardType:
-                  const TextInputType.numberWithOptions(
-                decimal: true,
-                signed: true,
-              ),
-
-              decoration:
-                  const InputDecoration(
-
-                border:
-                    OutlineInputBorder(),
-
-                labelText: "Longitude",
-
-                hintText:
-                    "Enter longitude",
-
-                prefixIcon: Icon(
-                  Icons.location_on,
-                ),
-              ),
+            _textField(
+              controller: lngController,
+              label: 'Longitude',
+              hint: 'e.g. 78.1198',
             ),
 
-            const SizedBox(height: 20),
+            const SizedBox(height: 16),
 
             // GET LOCATION
-
-            SizedBox(
-              width: double.infinity,
-
-              child: ElevatedButton.icon(
-
-                onPressed: getLocation,
-
-                icon: const Icon(
-                  Icons.my_location,
-                ),
-
-                label: const Text(
-                  "Get Current Location",
-                ),
+            OutlinedButton.icon(
+              onPressed: getLocation,
+              style: OutlinedButton.styleFrom(
+                foregroundColor: const Color(0xFF58A6FF),
+                side: const BorderSide(color: Color(0xFF1F6FEB)),
+                padding: const EdgeInsets.symmetric(vertical: 14),
               ),
+              icon: const Icon(Icons.my_location),
+              label: const Text('Use Current Location'),
             ),
 
-            const SizedBox(height: 30),
+            const SizedBox(height: 28),
+
+            // RESULT CARD
+            if (_lastResult != null) ...[
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: _lastResult!.success
+                      ? const Color(0xFF238636).withOpacity(0.2)
+                      : Colors.red.withOpacity(0.2),
+                  border: Border.all(
+                    color: _lastResult!.success
+                        ? const Color(0xFF238636)
+                        : Colors.red,
+                  ),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          _lastResult!.success
+                              ? Icons.check_circle
+                              : Icons.error,
+                          color: _lastResult!.success
+                              ? const Color(0xFF2ECC71)
+                              : Colors.red,
+                          size: 18,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          _lastResult!.success ? 'Uploaded!' : 'Upload Failed',
+                          style: TextStyle(
+                            color: _lastResult!.success
+                                ? const Color(0xFF2ECC71)
+                                : Colors.red,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      _lastResult!.message,
+                      style: const TextStyle(color: Colors.white70, fontSize: 13),
+                    ),
+                    if (_lastResult!.detectionLabel != null) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        'Detected: ${_lastResult!.detectionLabel}',
+                        style: const TextStyle(
+                            color: Colors.white54, fontSize: 12),
+                      ),
+                    ],
+                    if (_lastResult!.severity != null) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        'Severity: ${(_lastResult!.severity! * 100).toStringAsFixed(0)}%',
+                        style: const TextStyle(
+                            color: Colors.white54, fontSize: 12),
+                      ),
+                    ],
+                    if (_lastResult!.alertStage != null) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        'Alert Stage: ${_lastResult!.alertStage}',
+                        style: const TextStyle(
+                            color: Colors.white54, fontSize: 12),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+            ],
 
             // SUBMIT
-
             SizedBox(
-              width: double.infinity,
-              height: 50,
-
+              height: 52,
               child: ElevatedButton(
-
-                onPressed: () {
-
-                  if (image == null) {
-
-                    ScaffoldMessenger.of(context)
-                        .showSnackBar(
-                      const SnackBar(
-                        content: Text(
-                          "Please select a pothole image",
-                        ),
-                      ),
-                    );
-
-                    return;
-                  }
-
-                  if (latitudeController
-                      .text
-                      .isEmpty ||
-                      longitudeController
-                          .text
-                          .isEmpty) {
-
-                    ScaffoldMessenger.of(context)
-                        .showSnackBar(
-                      const SnackBar(
-                        content: Text(
-                          "Please enter latitude and longitude",
-                        ),
-                      ),
-                    );
-
-                    return;
-                  }
-
-                  ScaffoldMessenger.of(context)
-                      .showSnackBar(
-                    const SnackBar(
-                      content: Text(
-                        "Pot Hole Uploaded",
-                      ),
-                    ),
-                  );
-                },
-
-                child: const Text(
-                  "Submit",
-
-                  style: TextStyle(
-                    fontSize: 18,
+                onPressed: _uploading ? null : _submit,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF1F6FEB),
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
                   ),
+                  elevation: 0,
                 ),
+                child: _uploading
+                    ? const Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          ),
+                          SizedBox(width: 12),
+                          Text('Uploading…'),
+                        ],
+                      )
+                    : const Text(
+                        'Submit',
+                        style: TextStyle(
+                            fontSize: 16, fontWeight: FontWeight.bold),
+                      ),
               ),
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _textField({
+    required TextEditingController controller,
+    required String label,
+    required String hint,
+  }) {
+    return TextField(
+      controller: controller,
+      keyboardType: const TextInputType.numberWithOptions(
+        decimal: true,
+        signed: true,
+      ),
+      style: const TextStyle(color: Colors.white),
+      decoration: InputDecoration(
+        labelText: label,
+        hintText: hint,
+        labelStyle: const TextStyle(color: Colors.white54),
+        hintStyle: const TextStyle(color: Colors.white24),
+        prefixIcon: const Icon(Icons.location_on, color: Colors.white38),
+        enabledBorder: const OutlineInputBorder(
+          borderSide: BorderSide(color: Color(0xFF30363D)),
+        ),
+        focusedBorder: const OutlineInputBorder(
+          borderSide: BorderSide(color: Color(0xFF1F6FEB)),
+        ),
+        filled: true,
+        fillColor: const Color(0xFF161B22),
       ),
     );
   }
