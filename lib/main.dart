@@ -67,6 +67,13 @@ class _HomeScreenState extends State<HomeScreen> {
   // for sending end coordinates to /alert/stop.
   Position? _lastKnownPosition;
 
+  // NEW — latest alert pushed from the background isolate, kept
+  // ONLY for display (banner). Hardware (sound/torch) is triggered
+  // by the background isolate itself now — see background_service.dart —
+  // so this screen must NOT call AlertService.trigger() again, or
+  // you'd get it firing twice whenever the app happens to be open.
+  PotholeAlert? _latestAlert;
+
   // ===================================================
   // INIT  — unchanged
   // ===================================================
@@ -102,7 +109,11 @@ class _HomeScreenState extends State<HomeScreen> {
         severity: (data['severity'] as num?)?.toDouble(),
       );
 
-      await AlertService.instance.trigger(alert);
+      // Hardware alert (beep/torch/siren) already fired from the
+      // background isolate — see background_service.dart. This
+      // listener now only updates the on-screen banner so the UI
+      // reflects the current hazard state when the app is open.
+      if (mounted) setState(() => _latestAlert = alert);
     });
   }
 
@@ -229,6 +240,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
       service.invoke('stop');
       await AlertService.instance.stopAlert();
+
+      // Clear the on-screen banner too. (The hardware siren/torch
+      // is stopped inside the background isolate itself, triggered
+      // by its own 'stop' listener in background_service.dart.)
+      _latestAlert = null;
 
       // NEW — Get last GPS before stopping.
       // Sent to /alert/stop as end_lat / end_lon.
@@ -395,6 +411,58 @@ class _HomeScreenState extends State<HomeScreen> {
                     : Colors.white38,
               ),
             ),
+
+            // NEW — live hazard banner. Purely visual; the actual
+            // beep/torch/siren already fired from the background
+            // isolate the moment this alert was detected, even if
+            // this screen wasn't open at the time.
+            if (isRunning &&
+                _latestAlert != null &&
+                _latestAlert!.level != AlertLevel.none) ...[
+              const SizedBox(height: 20),
+              Container(
+                margin: const EdgeInsets.symmetric(horizontal: 24),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: (_latestAlert!.level == AlertLevel.stage3
+                          ? Colors.red
+                          : const Color(0xFFF39C12))
+                      .withOpacity(0.15),
+                  border: Border.all(
+                    color: _latestAlert!.level == AlertLevel.stage3
+                        ? Colors.red
+                        : const Color(0xFFF39C12),
+                  ),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.warning_amber_rounded,
+                      color: _latestAlert!.level == AlertLevel.stage3
+                          ? Colors.red
+                          : const Color(0xFFF39C12),
+                    ),
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: Text(
+                        _latestAlert!.distance != null
+                            ? '${_latestAlert!.message} · '
+                                '${_latestAlert!.distance!.toStringAsFixed(0)} m ahead'
+                            : _latestAlert!.message,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
 
             const SizedBox(height: 50),
 

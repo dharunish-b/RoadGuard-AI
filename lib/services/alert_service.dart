@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:torch_light/torch_light.dart';
+import 'package:vibration/vibration.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 import 'api_service.dart';
@@ -14,6 +15,15 @@ class AlertService {
 
   Timer? _flashTimer;
   bool _torchOn = false;
+
+  // NEW — cached once per app/isolate lifetime so we don't ask the
+  // platform channel on every single alert.
+  bool? _hasVibrator;
+
+  Future<bool> _canVibrate() async {
+    _hasVibrator ??= await Vibration.hasVibrator() ?? false;
+    return _hasVibrator!;
+  }
 
   // =====================================================
   // PUBLIC ENTRY POINT
@@ -29,6 +39,7 @@ class AlertService {
     // Stop anything from the previous alert first.
     await _cancelFlash();
     await _player.stop();
+    await Vibration.cancel();
 
     // Always reset looping before a new alert.
     await _player.setReleaseMode(ReleaseMode.release);
@@ -76,6 +87,15 @@ class AlertService {
     } catch (e) {
       print('[AlertService] STAGE 1 AUDIO ERROR: $e');
     }
+
+    // Single short buzz — matches the soft beep, just a heads-up.
+    if (await _canVibrate()) {
+      try {
+        await Vibration.vibrate(duration: 200, amplitude: 128);
+      } catch (e) {
+        print('[AlertService] STAGE 1 VIBRATION ERROR: $e');
+      }
+    }
   }
 
   // =====================================================
@@ -98,6 +118,23 @@ class AlertService {
       print('[AlertService] Stage 2 sound started');
     } catch (e) {
       print('[AlertService] STAGE 2 AUDIO ERROR: $e');
+    }
+
+    // 3 pulses of vibration, timed with the 3 torch flashes below.
+    // pattern = [wait, vibrate, wait, vibrate, wait, vibrate]
+    if (await _canVibrate()) {
+      try {
+        await Vibration.vibrate(
+          pattern: [0, 150, 150, 150, 150, 150],
+          intensities: [0, 200, 0, 200, 0, 200],
+        );
+      } catch (e) {
+        print('[AlertService] STAGE 2 VIBRATION ERROR: $e');
+        // Fallback for devices without amplitude/pattern support.
+        try {
+          await Vibration.vibrate(duration: 400);
+        } catch (_) {}
+      }
     }
 
     // 3 quick flashes
@@ -138,6 +175,22 @@ class AlertService {
       print('[AlertService] STAGE 3 AUDIO ERROR: $e');
     }
 
+    // Continuous strong vibration, looped — matches siren + torch urgency.
+    // pattern[0] is a leading 0ms wait, then alternating vibrate/pause,
+    // repeat: 1 tells the plugin to loop starting from pattern index 1
+    // indefinitely until Vibration.cancel() is called (in stopAlert()).
+    if (await _canVibrate()) {
+      try {
+        await Vibration.vibrate(
+          pattern: [0, 300, 200],
+          intensities: [0, 255, 0],
+          repeat: 1,
+        );
+      } catch (e) {
+        print('[AlertService] STAGE 3 VIBRATION ERROR: $e');
+      }
+    }
+
     // Continuous flashlight.
     _flashTimer = Timer.periodic(
       const Duration(milliseconds: 200),
@@ -159,6 +212,12 @@ class AlertService {
     print('[AlertService] stopAlert');
 
     await _cancelFlash();
+
+    try {
+      await Vibration.cancel();
+    } catch (e) {
+      print('[AlertService] stop vibration error: $e');
+    }
 
     try {
       await _player.stop();
@@ -207,6 +266,7 @@ class AlertService {
     _flashTimer?.cancel();
     _flashTimer = null;
 
+    await Vibration.cancel();
     await _player.stop();
     await _player.dispose();
   }

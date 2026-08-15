@@ -213,8 +213,13 @@ void onServiceStart(ServiceInstance service) async {
     );
   }
 
-  // Handle STOP signal from HomeScreen
-  service.on('stop').listen((_) => service.stopSelf());
+  // Handle STOP signal from HomeScreen.
+  // Also kill any live siren/torch — they live in THIS isolate now,
+  // so stopping the service alone won't silence them.
+  service.on('stop').listen((_) async {
+    await AlertService.instance.stopAlert();
+    service.stopSelf();
+  });
 
   // Receive config updates from the UI (speed, weather, backend URL)
   double speedKmh = 30.0;
@@ -237,6 +242,12 @@ void onServiceStart(ServiceInstance service) async {
     }
   });
 
+  // Tracks the last alert level so we only re-trigger hardware on a
+  // CHANGE of stage, not every single 10s poll. Without this, a
+  // continuous stage3 would restart the looping siren + torch timer
+  // every 10 seconds, causing an audible stutter.
+  AlertLevel lastAlertLevel = AlertLevel.none;
+
   // GPS poll + backend proximity check every 10 seconds
   Timer.periodic(const Duration(seconds: 10), (timer) async {
     try {
@@ -257,7 +268,22 @@ void onServiceStart(ServiceInstance service) async {
         weather:  weather,
       );
 
-      // Push alert level to the UI isolate (if app is open)
+      // NEW — fire beep/torch/siren directly from THIS isolate.
+      // This is what makes real-time alerts work whether the app
+      // is foregrounded, backgrounded, or the screen is off — the
+      // background isolate keeps running as long as the foreground
+      // service notification is alive.
+      // Only re-trigger on a stage CHANGE so a sustained stage3
+      // siren doesn't restart every poll cycle.
+      if (alert.level != lastAlertLevel) {
+        await AlertService.instance.trigger(alert);
+        lastAlertLevel = alert.level;
+      }
+
+      // Push alert level to the UI isolate too — purely for the
+      // in-app banner/state, NOT for triggering sound/torch again.
+      // (Main isolate must not call AlertService.trigger anymore,
+      // or you'd get double beeps/double flashes when app is open.)
       service.invoke('alert', {
         'level':    alert.level.index,
         'message':  alert.message,
