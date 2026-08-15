@@ -9,18 +9,18 @@ import 'services/alert_service.dart';
 import 'services/api_service.dart';
 
 // =====================================================
-// MAIN
+// MAIN  — unchanged
 // =====================================================
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await ApiConfig.load(); // restore last-connected ngrok URL, if any
+  await ApiConfig.load();
   await initBackgroundService();
   runApp(const RoadGuardApp());
 }
 
 // =====================================================
-// APP
+// APP  — unchanged
 // =====================================================
 
 class RoadGuardApp extends StatelessWidget {
@@ -59,8 +59,16 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   bool isRunning = false;
 
+  // NEW — active session kept in memory.
+  // Null when monitoring is stopped.
+  MonitoringSession? _activeSession;
+
+  // NEW — last known position for movement gate and
+  // for sending end coordinates to /alert/stop.
+  Position? _lastKnownPosition;
+
   // ===================================================
-  // INIT
+  // INIT  — unchanged
   // ===================================================
 
   @override
@@ -77,9 +85,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ===================================================
-  // LISTEN TO ALERTS FROM BACKGROUND SERVICE
-  // When the app is open, the service streams alert
-  // events — we trigger sound + flash here in the main isolate
+  // LISTEN TO ALERTS FROM BACKGROUND SERVICE  — unchanged
   // ===================================================
 
   void _listenToAlerts() {
@@ -101,11 +107,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ===================================================
-  // LOCATION GATE — runs on every tap of START, independent
-  // of the Simulation page (which has its own copy of this
-  // logic and is never touched by this code).
-  // Returns true only if location service is ON and permission
-  // is granted; otherwise shows a snack and returns false.
+  // LOCATION GATE  — unchanged
   // ===================================================
 
   Future<bool> _ensureLocationReady() async {
@@ -119,8 +121,6 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         );
       }
-      // Opens the device location settings screen so the user can
-      // flip it on themselves — apps cannot toggle it programmatically.
       await Geolocator.openLocationSettings();
       return false;
     }
@@ -145,20 +145,35 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ===================================================
+  // NEW — Get current GPS position (used for start/stop)
+  // Returns null silently if GPS unavailable.
+  // ===================================================
+
+  Future<Position?> _getCurrentPosition() async {
+    try {
+      return await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      ).timeout(const Duration(seconds: 8));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ===================================================
   // TOGGLE MONITORING
+  // Original flow preserved; /alert/start and /alert/stop
+  // calls added around the existing service start/stop.
   // ===================================================
 
   void toggleMonitoring() async {
     final service = FlutterBackgroundService();
 
     if (!isRunning) {
-      // Ask location EVERY time START is tapped.
+      // ── STARTING ──────────────────────────────────
+
       final locationReady = await _ensureLocationReady();
       if (!locationReady) return;
 
-      // Make sure the backend is actually reachable — but don't block
-      // START on it. If unreachable, warn only; monitoring still starts
-      // and will just keep retrying once a URL is reachable.
       final alive = await ApiService.instance.isBackendAlive();
       if (!alive && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -172,40 +187,70 @@ class _HomeScreenState extends State<HomeScreen> {
         );
       }
 
+      // NEW — Get GPS for /alert/start.
+      // If GPS times out, startMonitoring uses (0,0) and
+      // backend logs it as unknown-start. Non-blocking.
+      final startPos = await _getCurrentPosition();
+      _lastKnownPosition = startPos;
+
+      // NEW — Notify backend: session started.
+      // Uses default speed 30 km/h and dry weather as initial
+      // defaults. Background service will update these via
+      // 'config' invoke once the user sets them.
+      // startMonitoring is offline-tolerant (returns local
+      // fallback session if backend unreachable).
+      _activeSession = await ApiService.instance.startMonitoring(
+        lat: startPos?.latitude ?? 0.0,
+        lng: startPos?.longitude ?? 0.0,
+        speedKmh: 30.0,
+        weather: 'dry',
+      );
+
       final plugin = FlutterLocalNotificationsPlugin();
-      final android = plugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+      final android = plugin.resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin>();
       await android?.requestNotificationsPermission();
 
       _showBatteryTip();
 
-      // FIX: mark this as a real, user-initiated start BEFORE calling
-      // startService(). Without this, onServiceStart() in the background
-      // isolate always thinks Android silently relaunched it (its
-      // consent-gate check), fires the "Resume monitoring?" notification
-      // every single time, and stops itself — monitoring never actually runs.
       await markExplicitStart();
       await service.startService();
 
-      // Give the background isolate its base_url + default config.
-      // (It also re-reads the URL from SharedPreferences on every poll,
-      // this just avoids a cold-start race.)
       service.invoke('config', {
         'speed_kmh': 30.0,
         'weather': 'dry',
         'base_url': ApiConfig.baseUrl,
+        // NEW — pass session_id into background isolate so it
+        // can tag /alert/check calls with the session if needed.
+        'session_id': _activeSession?.sessionId ?? '',
       });
     } else {
+      // ── STOPPING ──────────────────────────────────
+
       service.invoke('stop');
       await AlertService.instance.stopAlert();
-      // App-side location usage ends here — background isolate's GPS
-      // polling timer stops with the service, so no further location
-      // reads happen until START is tapped again.
+
+      // NEW — Get last GPS before stopping.
+      // Sent to /alert/stop as end_lat / end_lon.
+      final endPos = await _getCurrentPosition();
+
+      // NEW — Notify backend: session ended.
+      // Fire-and-forget; fail silently (stopMonitoring handles it).
+      if (_activeSession != null) {
+        await ApiService.instance.stopMonitoring(
+          sessionId: _activeSession!.sessionId,
+          endLat: endPos?.latitude ?? _lastKnownPosition?.latitude ?? 0.0,
+          endLng: endPos?.longitude ?? _lastKnownPosition?.longitude ?? 0.0,
+        );
+        _activeSession = null;
+      }
+
+      _lastKnownPosition = null;
     }
 
     final nowRunning = !isRunning;
     setState(() => isRunning = nowRunning);
 
-    // Persist state so boot handler knows user's intent
     await saveMonitoringState(nowRunning);
 
     if (mounted) {
@@ -219,6 +264,10 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
   }
+
+  // ===================================================
+  // BATTERY TIP DIALOG  — unchanged
+  // ===================================================
 
   void _showBatteryTip() {
     showDialog(
@@ -247,7 +296,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ===================================================
-  // UI
+  // UI  — unchanged
   // ===================================================
 
   @override
@@ -255,20 +304,12 @@ class _HomeScreenState extends State<HomeScreen> {
     return Scaffold(
       backgroundColor: const Color(0xFF0D1117),
 
-      // =================================================
-      // APP BAR
-      // =================================================
-
       appBar: AppBar(
         title: const Text(
           'Road Guard AI',
           style: TextStyle(fontWeight: FontWeight.bold),
         ),
       ),
-
-      // =================================================
-      // DRAWER
-      // =================================================
 
       drawer: Drawer(
         backgroundColor: const Color(0xFF161B22),
@@ -327,10 +368,6 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       ),
 
-      // =================================================
-      // BODY
-      // =================================================
-
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -361,15 +398,15 @@ class _HomeScreenState extends State<HomeScreen> {
 
             const SizedBox(height: 50),
 
-            // Round START / STOP button
             SizedBox(
               width: 180,
               height: 180,
               child: ElevatedButton(
                 onPressed: toggleMonitoring,
                 style: ElevatedButton.styleFrom(
-                  backgroundColor:
-                      isRunning ? const Color(0xFFDA3633) : const Color(0xFF238636),
+                  backgroundColor: isRunning
+                      ? const Color(0xFFDA3633)
+                      : const Color(0xFF238636),
                   foregroundColor: Colors.white,
                   shape: const CircleBorder(),
                   elevation: 8,

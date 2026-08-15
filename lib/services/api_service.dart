@@ -10,6 +10,10 @@ const Map<String, String> kNgrokSkipHeader = {
   'ngrok-skip-browser-warning': 'true',
 };
 
+// =====================================================
+// API CONFIG  — unchanged
+// =====================================================
+
 class ApiConfig {
   static String _baseUrl = kDefaultBaseUrl;
   static bool _loaded = false;
@@ -41,6 +45,10 @@ class ApiConfig {
   }
 }
 
+// =====================================================
+// ENUMS & MODELS  — unchanged
+// =====================================================
+
 enum AlertLevel {
   none,
   stage1,
@@ -68,7 +76,6 @@ class PotholeAlert {
         message: 'All clear',
       );
 
-  // Backend (/alert) returns: { "alert": bool, "severity": "low"|"medium"|"high"|"critical", ... }
   factory PotholeAlert.fromJson(Map<String, dynamic> json) {
     final bool fires = json['alert'] as bool? ?? false;
     final String? severityStr = json['severity'] as String?;
@@ -108,7 +115,6 @@ class UploadResult {
     this.detectionLabel,
   });
 
-  // Backend (/upload) returns: { "detections": n, "results": [ {severity, fall_type, confidence, ...} ] }
   factory UploadResult.fromJson(Map<String, dynamic> json) {
     final int detections = (json['detections'] as num?)?.toInt() ?? 0;
     final List results = json['results'] as List? ?? [];
@@ -138,11 +144,44 @@ class UploadResult {
       UploadResult(success: false, message: msg);
 }
 
+// =====================================================
+// NEW — Monitoring session model
+// Returned by /alert/start, carried until /alert/stop
+// =====================================================
+
+class MonitoringSession {
+  final String sessionId;
+  final DateTime startedAt;
+
+  const MonitoringSession({
+    required this.sessionId,
+    required this.startedAt,
+  });
+
+  factory MonitoringSession.fromJson(Map<String, dynamic> json) {
+    return MonitoringSession(
+      sessionId: json['session_id'] as String? ?? '',
+      startedAt: DateTime.tryParse(json['started_at'] as String? ?? '') ??
+          DateTime.now(),
+    );
+  }
+}
+
+// =====================================================
+// API SERVICE
+// =====================================================
+
 class ApiService {
   ApiService._();
   static final ApiService instance = ApiService._();
 
-  // GET /alert?lat=..&lon=..&speed_kmh=..
+  // ---------------------------------------------------
+  // EXISTING — GET /alert  (unchanged)
+  // Called by background service polling loop.
+  // Movement gate is applied BEFORE calling this —
+  // see background_service.dart / HomeScreen.
+  // ---------------------------------------------------
+
   Future<PotholeAlert> checkNearby({
     required double lat,
     required double lng,
@@ -174,36 +213,44 @@ class ApiService {
       return PotholeAlert.none();
     }
   }
+
+  // ---------------------------------------------------
+  // EXISTING — GET /simulate/step  (unchanged)
+  // ---------------------------------------------------
+
   Future<PotholeAlert> simulateStep({
-  required String potholeId,
-  required int step,
-  required String condition,
-}) async {
-  try {
-    final uri = Uri.parse('${ApiConfig.baseUrl}/simulate/step').replace(
-      queryParameters: {
-        'pothole_id': potholeId,
-        'step': step.toString(),
-        'condition': condition,
-      },
-    );
+    required String potholeId,
+    required int step,
+    required String condition,
+  }) async {
+    try {
+      final uri = Uri.parse('${ApiConfig.baseUrl}/simulate/step').replace(
+        queryParameters: {
+          'pothole_id': potholeId,
+          'step': step.toString(),
+          'condition': condition,
+        },
+      );
 
-    final response = await http
-        .get(uri, headers: kNgrokSkipHeader)
-        .timeout(ApiConfig.timeout);
+      final response = await http
+          .get(uri, headers: kNgrokSkipHeader)
+          .timeout(ApiConfig.timeout);
 
-    if (response.statusCode == 200) {
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      return PotholeAlert.fromJson(data);
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        return PotholeAlert.fromJson(data);
+      }
+
+      return PotholeAlert.none();
+    } catch (_) {
+      return PotholeAlert.none();
     }
-
-    return PotholeAlert.none();
-  } catch (_) {
-    return PotholeAlert.none();
   }
-}
 
-  // POST /upload  (multipart: image, lat, lon, speed_kmh)
+  // ---------------------------------------------------
+  // EXISTING — POST /upload  (unchanged)
+  // ---------------------------------------------------
+
   Future<UploadResult> uploadPothole({
     required File imageFile,
     required double lat,
@@ -228,9 +275,7 @@ class ApiService {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
         return UploadResult.fromJson(data);
       } else {
-        return UploadResult.error(
-          'Server error ${response.statusCode}',
-        );
+        return UploadResult.error('Server error ${response.statusCode}');
       }
     } on SocketException {
       return UploadResult.error(
@@ -242,7 +287,10 @@ class ApiService {
     }
   }
 
-  // GET /health
+  // ---------------------------------------------------
+  // EXISTING — GET /health  (unchanged)
+  // ---------------------------------------------------
+
   Future<bool> isBackendAlive({String? overrideUrl}) async {
     try {
       final base = overrideUrl ?? ApiConfig.baseUrl;
@@ -254,5 +302,101 @@ class ApiService {
     } catch (_) {
       return false;
     }
+  }
+
+  // ---------------------------------------------------
+  // NEW — POST /alert/start
+  // Called when user taps START button.
+  // Backend creates a session document in MongoDB and
+  // returns a session_id used for /alert/stop.
+  // If backend unreachable, returns a local fallback
+  // session so monitoring still runs (offline-tolerant).
+  // ---------------------------------------------------
+
+  Future<MonitoringSession> startMonitoring({
+    required double lat,
+    required double lng,
+    required double speedKmh,
+    required String weather,
+  }) async {
+    try {
+      final uri = Uri.parse('${ApiConfig.baseUrl}/alert/start');
+
+      final response = await http
+          .post(
+            uri,
+            headers: {
+              ...kNgrokSkipHeader,
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({
+              'lat': lat,
+              'lon': lng,
+              'speed_kmh': speedKmh,
+              'weather': weather,
+            }),
+          )
+          .timeout(ApiConfig.timeout);
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        return MonitoringSession.fromJson(data);
+      }
+
+      // Non-200 — use local fallback session
+      return _localSession();
+    } on SocketException {
+      return _localSession();
+    } catch (_) {
+      return _localSession();
+    }
+  }
+
+  // ---------------------------------------------------
+  // NEW — POST /alert/stop
+  // Called when user taps STOP button.
+  // Sends session summary back to backend (MongoDB).
+  // Fails silently — STOP always succeeds on UI side.
+  // ---------------------------------------------------
+
+  Future<void> stopMonitoring({
+    required String sessionId,
+    required double endLat,
+    required double endLng,
+  }) async {
+    try {
+      final uri = Uri.parse('${ApiConfig.baseUrl}/alert/stop');
+
+      await http
+          .post(
+            uri,
+            headers: {
+              ...kNgrokSkipHeader,
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({
+              'session_id': sessionId,
+              'end_lat': endLat,
+              'end_lon': endLng,
+            }),
+          )
+          .timeout(ApiConfig.timeout);
+
+      // Response ignored — STOP is fire-and-forget.
+    } catch (_) {
+      // Fail silently. UI has already stopped monitoring.
+    }
+  }
+
+  // ---------------------------------------------------
+  // INTERNAL — local fallback session when backend down
+  // Allows monitoring to run even if /alert/start fails.
+  // ---------------------------------------------------
+
+  MonitoringSession _localSession() {
+    return MonitoringSession(
+      sessionId: 'local_${DateTime.now().millisecondsSinceEpoch}',
+      startedAt: DateTime.now(),
+    );
   }
 }

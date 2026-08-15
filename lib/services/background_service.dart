@@ -7,27 +7,21 @@ import 'api_service.dart';
 import 'alert_service.dart';
 
 // =====================================================
-// CONSTANTS
+// CHANNEL / NOTIFICATION IDs
 // =====================================================
 
-const String notifChannelId = 'road_guard_channel';
-const String alertChannelId = 'road_guard_alerts';
-const String bootChannelId = 'road_guard_boot';
-const int foregroundNotifId = 1;
-const int bootPromptNotifId = 2;
+const String kForegroundChannelId = 'road_guard_channel';
+const String kAlertChannelId      = 'road_guard_alerts';
+const String kBootChannelId       = 'road_guard_boot';
 
-// SharedPreferences keys
-// kMonitoringPref     — the user's last known monitoring INTENT
-//                       (were they running it before the phone restarted?)
-// kExplicitStartPref  — a one-shot flag set right before we call
-//                       service.startService() from a real user action
-//                       (START button, or tapping YES on the resume
-//                       prompt). If onServiceStart() runs WITHOUT this
-//                       flag set, it means Android silently relaunched
-//                       the service on its own (typically after a
-//                       device reboot) — in that case we must NOT start
-//                       monitoring; we only ask.
-const String kMonitoringPref = 'monitoring_active';
+const int kForegroundNotifId = 1;
+const int kBootPromptNotifId = 2;
+
+// =====================================================
+// SHARED PREFERENCES KEYS
+// =====================================================
+
+const String kMonitoringPref    = 'monitoring_active';
 const String kExplicitStartPref = 'explicit_start_requested';
 
 // =====================================================
@@ -36,72 +30,69 @@ const String kExplicitStartPref = 'explicit_start_requested';
 
 Future<void> initBackgroundService() async {
   final service = FlutterBackgroundService();
-  final FlutterLocalNotificationsPlugin notifPlugin =
-      FlutterLocalNotificationsPlugin();
 
-  await notifPlugin.initialize(
+  // ── Initialize notification plugin (main isolate only) ────────────
+  // This instance lives in the MAIN isolate. The background isolate
+  // gets its own separate Dart VM and must call initialize() itself.
+  final plugin = FlutterLocalNotificationsPlugin();
+
+  await plugin.initialize(
     const InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
     ),
-    onDidReceiveNotificationResponse: _onBootNotificationTap,
-    // Lets the YES / No thanks buttons work even if the app process
-    // isn't alive when the notification is tapped (e.g. right after
-    // a reboot, before the user has opened the app).
-    onDidReceiveBackgroundNotificationResponse:
-        _onBootNotificationTapBackground,
+    // Fires when the app IS open and the user taps the boot notification.
+    onDidReceiveNotificationResponse: _onBootTapForeground,
+    // Fires when the app is NOT open (just after reboot, e.g.).
+    // MUST be a top-level @pragma('vm:entry-point') function.
+    onDidReceiveBackgroundNotificationResponse: _onBootTapBackground,
   );
 
-  // Create all channels
-  final androidImpl = notifPlugin
-      .resolvePlatformSpecificImplementation<
+  final androidImpl =
+      plugin.resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin>();
 
+  // Silent persistent foreground notification channel
   await androidImpl?.createNotificationChannel(
     const AndroidNotificationChannel(
-      notifChannelId,
+      kForegroundChannelId,
       'Road Guard AI',
       description: 'Road Guard is actively monitoring for potholes',
       importance: Importance.low,
     ),
   );
 
+  // High-priority hazard alert channel (stage 2 / 3 pop-ups)
   await androidImpl?.createNotificationChannel(
     const AndroidNotificationChannel(
-      alertChannelId,
+      kAlertChannelId,
       'Hazard Alerts',
       description: 'Pothole and road hazard warnings',
       importance: Importance.max,
     ),
   );
 
+  // Boot consent channel (YES / No prompt after reboot)
   await androidImpl?.createNotificationChannel(
     const AndroidNotificationChannel(
-      bootChannelId,
+      kBootChannelId,
       'Boot Prompt',
       description: 'Asks if you want to resume monitoring after restart',
       importance: Importance.high,
     ),
   );
 
+  // ── Configure background service ──────────────────────────────────
   await service.configure(
     androidConfiguration: AndroidConfiguration(
       onStart: onServiceStart,
-      autoStart: false, // ← Never start right after configure(); only on
-      //                    an explicit user action.
-      // The plugin's own native boot receiver WILL relaunch this
-      // isolate after a device reboot — that's fine, we want the
-      // chance to intercept it (see onServiceStart below) rather than
-      // disabling it, since there's no other reliable headless hook
-      // available without writing custom native Android code.
-      autoStartOnBoot: true,
+      autoStart: false,        // never starts unless we call startService()
+      autoStartOnBoot: true,   // plugin's BroadcastReceiver fires on reboot
+                               // → we intercept in the consent gate below
       isForegroundMode: true,
-      notificationChannelId: notifChannelId,
+      notificationChannelId: kForegroundChannelId,
       initialNotificationTitle: 'Road Guard AI',
-      // Neutral wording: this shows briefly on EVERY start, including
-      // the post-boot consent check, so it must not claim monitoring
-      // is active before we've confirmed that.
       initialNotificationContent: 'Starting…',
-      foregroundServiceNotificationId: foregroundNotifId,
+      foregroundServiceNotificationId: kForegroundNotifId,
     ),
     iosConfiguration: IosConfiguration(
       autoStart: false,
@@ -111,58 +102,251 @@ Future<void> initBackgroundService() async {
 }
 
 // =====================================================
-// BOOT CONSENT PROMPT
-// Called from onServiceStart() when we detect the service
-// was relaunched by Android itself (not by the user tapping
-// START), typically right after a device reboot. Instead of
-// silently resuming monitoring, we ask first.
+// NOTIFICATION TAP HANDLERS
+//
+// Both MUST be top-level @pragma functions — never closures
+// or instance methods — so the AOT compiler keeps them.
 // =====================================================
 
-Future<void> _promptResumeConsent() async {
+@pragma('vm:entry-point')
+void _onBootTapForeground(NotificationResponse response) {
+  _handleBootResponse(response);
+}
+
+@pragma('vm:entry-point')
+void _onBootTapBackground(NotificationResponse response) {
+  // Runs in a separate tiny isolate spawned by the notification system.
+  // Calling async functions is fine here.
+  _handleBootResponse(response);
+}
+
+Future<void> _handleBootResponse(NotificationResponse response) async {
   final prefs = await SharedPreferences.getInstance();
-  final wasMonitoring = prefs.getBool(kMonitoringPref) ?? false;
+  if (response.actionId == 'action_yes') {
+    await prefs.setBool(kExplicitStartPref, true);
+    await prefs.setBool(kMonitoringPref, true);
+    await FlutterBackgroundService().startService();
+  } else if (response.actionId == 'action_no') {
+    await prefs.setBool(kMonitoringPref, false);
+  }
+}
 
-  if (!wasMonitoring) return; // User had it off — don't nag them
+// =====================================================
+// SAVE MONITORING STATE — call from HomeScreen toggle
+// =====================================================
 
-  final FlutterLocalNotificationsPlugin notifPlugin =
-      FlutterLocalNotificationsPlugin();
+Future<void> saveMonitoringState(bool isActive) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(kMonitoringPref, isActive);
+}
 
-  await notifPlugin.initialize(
+// =====================================================
+// MARK EXPLICIT USER START
+// Call in HomeScreen RIGHT BEFORE service.startService()
+// =====================================================
+
+Future<void> markExplicitStart() async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(kExplicitStartPref, true);
+}
+
+// =====================================================
+// SERVICE ENTRY POINT
+// Runs in the BACKGROUND ISOLATE — completely separate
+// Dart VM from the main isolate. No shared memory.
+//
+// Called in exactly two situations:
+//   A) User pressed START (explicitStart = true)  → monitor
+//   B) Android rebooted  (explicitStart = false)  → ask first
+// =====================================================
+
+@pragma('vm:entry-point')
+void onServiceStart(ServiceInstance service) async {
+  // The background isolate has its own fresh Dart VM.
+  // Load the persisted ngrok URL from SharedPreferences.
+  await ApiConfig.load();
+
+  final prefs        = await SharedPreferences.getInstance();
+  final bool explicit = prefs.getBool(kExplicitStartPref) ?? false;
+
+  // =============================================================
+  // PATH B — Android relaunched us (reboot or system restart).
+  //
+  // FIX: isForegroundMode:true means Android expects a foreground
+  // notification within ~5 seconds or it kills the service (ANR).
+  // We MUST call setForegroundNotificationInfo() immediately here,
+  // BEFORE the async notification show(), or the service is killed
+  // before the boot prompt ever appears.
+  // =============================================================
+  if (!explicit) {
+    // Satisfy Android's foreground notification requirement first.
+    if (service is AndroidServiceInstance) {
+      await service.setForegroundNotificationInfo(
+        title: 'Road Guard AI',
+        content: 'Tap to resume monitoring…',
+      );
+    }
+
+    // Now show the boot consent prompt (YES / No thanks).
+    await _showBootConsentPrompt(service);
+
+    // Stop the service — we're just a messenger, not monitoring yet.
+    service.stopSelf();
+    return;
+  }
+
+  // =============================================================
+  // PATH A — Explicit user start (START button or YES on prompt).
+  // =============================================================
+
+  // Consume the one-shot flag so future silent relaunches don't
+  // bypass the consent gate.
+  await prefs.setBool(kExplicitStartPref, false);
+
+  // Update foreground notification to "Active" now that we know
+  // we're actually monitoring. This is the fix for the missing
+  // "Monitoring active" notification after pressing START.
+  if (service is AndroidServiceInstance) {
+    await service.setForegroundNotificationInfo(
+      title: '🛡️ Road Guard AI — Active',
+      content: 'Monitoring your location for potholes',
+    );
+  }
+
+  // Handle STOP signal from HomeScreen
+  service.on('stop').listen((_) => service.stopSelf());
+
+  // Receive config updates from the UI (speed, weather, backend URL)
+  double speedKmh = 30.0;
+  String weather  = 'dry';
+
+  service.on('config').listen((data) async {
+    if (data == null) return;
+    speedKmh = (data['speed_kmh'] as num?)?.toDouble() ?? speedKmh;
+    weather  = data['weather']   as String? ?? weather;
+    final url = data['base_url'] as String?;
+    if (url != null && url.trim().isNotEmpty) {
+      await ApiConfig.setBaseUrl(url.trim());
+    }
+    // Reflect current config in the foreground notification
+    if (service is AndroidServiceInstance) {
+      await service.setForegroundNotificationInfo(
+        title: '🛡️ Road Guard AI — Active',
+        content: '${speedKmh.toInt()} km/h · $weather · scanning…',
+      );
+    }
+  });
+
+  // GPS poll + backend proximity check every 10 seconds
+  Timer.periodic(const Duration(seconds: 10), (timer) async {
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) return;
+
+      final LocationPermission perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied ||
+          perm == LocationPermission.deniedForever) return;
+
+      final Position pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+
+      final PotholeAlert alert = await ApiService.instance.checkNearby(
+        lat:      pos.latitude,
+        lng:      pos.longitude,
+        speedKmh: speedKmh,
+        weather:  weather,
+      );
+
+      // Push alert level to the UI isolate (if app is open)
+      service.invoke('alert', {
+        'level':    alert.level.index,
+        'message':  alert.message,
+        'distance': alert.distance,
+        'severity': alert.severity,
+      });
+
+      // Heads-up notification for stage 2 / 3 hazards
+      await AlertNotificationHelper.showHazardNotification(alert);
+
+      // Keep the foreground notification live with last-checked time
+      if (service is AndroidServiceInstance) {
+        final now     = DateTime.now();
+        final timeStr =
+            '${now.hour.toString().padLeft(2, '0')}:'
+            '${now.minute.toString().padLeft(2, '0')}';
+
+        final String content = alert.level == AlertLevel.none
+            ? 'All clear · last checked $timeStr'
+            : '⚠️ ${alert.message} · $timeStr';
+
+        await service.setForegroundNotificationInfo(
+          title: '🛡️ Road Guard AI — Active',
+          content: content,
+        );
+      }
+    } catch (_) {
+      // Never crash the background service
+    }
+  });
+}
+
+// =====================================================
+// BOOT CONSENT PROMPT (runs inside background isolate)
+//
+// The background isolate has its OWN Dart VM — it has no
+// access to the FlutterLocalNotificationsPlugin instance
+// initialized in main(). We create a fresh local instance
+// here and initialize it before calling show().
+// =====================================================
+
+Future<void> _showBootConsentPrompt(ServiceInstance service) async {
+  final prefs = await SharedPreferences.getInstance();
+  if (!(prefs.getBool(kMonitoringPref) ?? false)) return;
+
+  // Fresh plugin instance for this isolate
+  final plugin = FlutterLocalNotificationsPlugin();
+
+  await plugin.initialize(
     const InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
     ),
-    onDidReceiveNotificationResponse: _onBootNotificationTap,
-    onDidReceiveBackgroundNotificationResponse:
-        _onBootNotificationTapBackground,
+    // Only the background handler matters here — the main isolate
+    // registers the foreground handler when the app opens.
+    onDidReceiveBackgroundNotificationResponse: _onBootTapBackground,
   );
 
-  final androidImpl = notifPlugin.resolvePlatformSpecificImplementation<
-      AndroidFlutterLocalNotificationsPlugin>();
+  final androidImpl =
+      plugin.resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin>();
+
   await androidImpl?.createNotificationChannel(
     const AndroidNotificationChannel(
-      bootChannelId,
+      kBootChannelId,
       'Boot Prompt',
       description: 'Asks if you want to resume monitoring after restart',
       importance: Importance.high,
     ),
   );
 
-  await notifPlugin.show(
-    bootPromptNotifId,
-    'Resume Road Guard monitoring?',
-    'You were monitoring before your device restarted. Tap YES to resume.',
+  await plugin.show(
+    kBootPromptNotifId,
+    '🛡️ Resume Road Guard monitoring?',
+    'You were monitoring before your device restarted.',
     NotificationDetails(
       android: AndroidNotificationDetails(
-        bootChannelId,
+        kBootChannelId,
         'Boot Prompt',
-        channelDescription: 'Asks if you want to resume monitoring',
+        channelDescription: 'Resume monitoring prompt',
         importance: Importance.high,
         priority: Priority.high,
+        autoCancel: false,
+        ongoing: false,
         actions: [
           const AndroidNotificationAction(
             'action_yes',
             'YES, Resume',
-            showsUserInterface: true,
+            showsUserInterface: true,   // opens the app
+            cancelNotification: true,
           ),
           const AndroidNotificationAction(
             'action_no',
@@ -173,144 +357,4 @@ Future<void> _promptResumeConsent() async {
       ),
     ),
   );
-}
-
-// Called when the user taps YES / No thanks — works whether the app
-// process is alive (foreground handler) or not (background handler).
-@pragma('vm:entry-point')
-void _onBootNotificationTap(NotificationResponse response) async {
-  await _handleBootResponse(response);
-}
-
-@pragma('vm:entry-point')
-void _onBootNotificationTapBackground(NotificationResponse response) async {
-  await _handleBootResponse(response);
-}
-
-Future<void> _handleBootResponse(NotificationResponse response) async {
-  final prefs = await SharedPreferences.getInstance();
-  if (response.actionId == 'action_yes') {
-    // This IS the explicit user consent — flag it so onServiceStart()
-    // knows it's allowed to actually monitor this time.
-    await prefs.setBool(kExplicitStartPref, true);
-    await prefs.setBool(kMonitoringPref, true);
-    final service = FlutterBackgroundService();
-    await service.startService();
-  } else if (response.actionId == 'action_no') {
-    await prefs.setBool(kMonitoringPref, false);
-  }
-}
-
-// =====================================================
-// SAVE MONITORING STATE — call from HomeScreen
-// =====================================================
-
-Future<void> saveMonitoringState(bool isActive) async {
-  final prefs = await SharedPreferences.getInstance();
-  await prefs.setBool(kMonitoringPref, isActive);
-}
-
-// =====================================================
-// MARK AN EXPLICIT, USER-INITIATED START
-// Call this right before service.startService() from the
-// START button so onServiceStart() can tell "user pressed
-// START" apart from "Android silently relaunched me".
-// =====================================================
-
-Future<void> markExplicitStart() async {
-  final prefs = await SharedPreferences.getInstance();
-  await prefs.setBool(kExplicitStartPref, true);
-}
-
-// =====================================================
-// SERVICE ENTRY POINT — runs in background isolate
-// =====================================================
-
-@pragma('vm:entry-point')
-void onServiceStart(ServiceInstance service) async {
-  // Stop signal from toggleMonitoring()
-  service.on('stop').listen((event) {
-    service.stopSelf();
-  });
-
-  // The background service runs in its OWN isolate, so it does NOT
-  // share ApiConfig's in-memory static with the UI isolate. Load the
-  // last-connected ngrok URL from SharedPreferences here.
-  await ApiConfig.load();
-
-  // ---------------------------------------------------------------
-  // CONSENT GATE — this is the important bit.
-  // If this start was not explicitly requested (START button, or
-  // tapping YES on the resume prompt), it means Android relaunched
-  // us on its own — almost always right after a device reboot.
-  // We NEVER start monitoring in that case; we only ask.
-  // ---------------------------------------------------------------
-  final prefs = await SharedPreferences.getInstance();
-  final bool explicitStart = prefs.getBool(kExplicitStartPref) ?? false;
-
-  if (!explicitStart) {
-    await _promptResumeConsent();
-    service.stopSelf();
-    return;
-  }
-
-  // Consume the one-shot flag so a *future* silent restart isn't
-  // mistaken for consent again.
-  await prefs.setBool(kExplicitStartPref, false);
-
-  // Receive speed + weather + base_url config from the UI (Start button
-  // or Simulation page "Connect")
-  double speedKmh = 30.0;
-  String weather = 'dry';
-
-  service.on('config').listen((data) async {
-    if (data != null) {
-      speedKmh = (data['speed_kmh'] as num?)?.toDouble() ?? speedKmh;
-      weather = data['weather'] as String? ?? weather;
-      final newUrl = data['base_url'] as String?;
-      if (newUrl != null && newUrl.trim().isNotEmpty) {
-        await ApiConfig.setBaseUrl(newUrl);
-      }
-    }
-  });
-
-  // -------------------------------------------------------
-  // GPS polling + backend proximity check every 10 seconds
-  // -------------------------------------------------------
-  Timer.periodic(const Duration(seconds: 10), (timer) async {
-    try {
-      final bool serviceEnabled =
-          await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled) return;
-
-      final LocationPermission perm =
-          await Geolocator.checkPermission();
-      if (perm == LocationPermission.denied ||
-          perm == LocationPermission.deniedForever) return;
-
-      final Position pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
-      );
-
-      final PotholeAlert alert = await ApiService.instance.checkNearby(
-        lat: pos.latitude,
-        lng: pos.longitude,
-        speedKmh: speedKmh,
-        weather: weather,
-      );
-
-      // Send alert level back to the UI (if app is open)
-      service.invoke('alert', {
-        'level': alert.level.index,
-        'message': alert.message,
-        'distance': alert.distance,
-        'severity': alert.severity,
-      });
-
-      // Show a notification for stage 2 / 3
-      await AlertNotificationHelper.showHazardNotification(alert);
-    } catch (_) {
-      // Never crash the background service
-    }
-  });
 }
