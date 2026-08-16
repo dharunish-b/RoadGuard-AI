@@ -1,6 +1,6 @@
 <div align="center">
   <img src="road-guard-ai.png" alt="Road Guard AI Logo" width="500" height="500"/>
-  <h1>Road Guard AI - Frontend 📱</h1>
+  <h1>Road Guard- AI 📱</h1>
   <p><em>AI-Powered Pothole Detection & Rider Safety Application</em></p>
 </div>
 
