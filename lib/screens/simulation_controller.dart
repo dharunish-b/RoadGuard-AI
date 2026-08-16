@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
 import '../services/alert_service.dart';
+import '../constants/simulation_coords.dart'; // kDemoPotholeIdKey, kPotholeIdFallback
 
 // =====================================================
 // SIMULATION CONSTANTS
@@ -15,9 +17,11 @@ import '../services/alert_service.dart';
 //
 // Total runtime = 20+20+15+15+10+10 = 90 seconds
 // Post-simulation cooldown = 3 minutes (180s)
+//
+// kPotholeId is now sourced from constants/simulation_coords.dart
+// so UploadPotholePage (demo mode) and SimulationController
+// always point at the same seeded document.
 // =====================================================
-
-const String kPotholeId          = '6a7d97d7d97b2fc1c888747c';
 const int    kTotalSteps          = 6;
 const int    kCooldownDurationSec = 180;
 
@@ -81,6 +85,10 @@ class SimulationController {
   Position? position;
   PotholeAlert? lastAlert;
   AlertLevel    lastTriggeredLevel = AlertLevel.none;
+
+  // The pothole ID used for this run. Resolved from SharedPreferences
+  // at startSimulation() time so it always matches the last demo upload.
+  String _activePotholeId = kPotholeIdFallback;
 
   int    currentStep       = 0;
   int    secondsRemaining  = 20;
@@ -180,6 +188,12 @@ class SimulationController {
     final pos = await getLocation(showSnack);
     if (pos == null) return;
 
+    // Resolve which pothole ID to use for this run.
+    // If a demo upload was done, its returned _id is in prefs.
+    // Falls back to kPotholeIdFallback if prefs is empty.
+    final prefs = await SharedPreferences.getInstance();
+    _activePotholeId = prefs.getString(kDemoPotholeIdKey) ?? kPotholeIdFallback;
+
     position             = pos;
     running              = true;
     inCooldown           = false;
@@ -262,7 +276,7 @@ class SimulationController {
     if (position == null) return;
 
     final alert = await ApiService.instance.simulateStep(
-      potholeId: kPotholeId,
+      potholeId: _activePotholeId,
       step:      currentStep - 1,
       condition: weather,
     );

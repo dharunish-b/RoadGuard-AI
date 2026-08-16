@@ -107,12 +107,18 @@ class UploadResult {
   final double? severity;
   final String? detectionLabel;
 
+  /// MongoDB _id of the first pothole saved by this upload.
+  /// Null when YOLO detected nothing. Used by demo mode to pass
+  /// the exact ID to SimulationController via SharedPreferences.
+  final String? potholeId;
+
   const UploadResult({
     required this.success,
     required this.message,
     this.alertStage,
     this.severity,
     this.detectionLabel,
+    this.potholeId,
   });
 
   factory UploadResult.fromJson(Map<String, dynamic> json) {
@@ -129,6 +135,11 @@ class UploadResult {
       _ => AlertLevel.none,
     };
 
+    // pothole_ids is a list — take the first entry (most uploads produce one).
+    final List potholeIds = json['pothole_ids'] as List? ?? [];
+    final String? potholeId =
+        potholeIds.isNotEmpty ? potholeIds.first as String? : null;
+
     return UploadResult(
       success: detections > 0,
       message: detections > 0
@@ -137,6 +148,7 @@ class UploadResult {
       alertStage: level == AlertLevel.none ? null : level.index,
       severity: (first?['confidence'] as num?)?.toDouble(),
       detectionLabel: first?['fall_type'] as String?,
+      potholeId: potholeId,
     );
   }
 
@@ -399,4 +411,124 @@ class ApiService {
       startedAt: DateTime.now(),
     );
   }
+
+  // ---------------------------------------------------
+  // GET /reports
+  // Returns all pothole reports from MongoDB.
+  // includeFixed=false hides already-fixed potholes.
+  // ---------------------------------------------------
+
+  Future<List<PotholeReport>> getReports({bool includeFixed = true}) async {
+    try {
+      final uri = Uri.parse('${ApiConfig.baseUrl}/reports').replace(
+        queryParameters: {
+          'include_fixed': includeFixed.toString(),
+          'limit': '100',
+        },
+      );
+
+      final response = await http
+          .get(uri, headers: kNgrokSkipHeader)
+          .timeout(ApiConfig.timeout);
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final List reports = data['reports'] as List? ?? [];
+        return reports
+            .map((r) => PotholeReport.fromJson(r as Map<String, dynamic>))
+            .toList();
+      }
+      return [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  // ---------------------------------------------------
+  // PATCH /reports/{pothole_id}/fix
+  // Marks a pothole as fixed. Returns true on success.
+  // ---------------------------------------------------
+
+  Future<bool> markPotholeFixed(String potholeId) async {
+    try {
+      final uri =
+          Uri.parse('${ApiConfig.baseUrl}/reports/$potholeId/fix');
+
+      final response = await http
+          .patch(uri, headers: kNgrokSkipHeader)
+          .timeout(ApiConfig.timeout);
+
+      return response.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
+// =====================================================
+// POTHOLE REPORT MODEL
+// Mirrors the JSON shape returned by GET /reports
+// =====================================================
+
+class PotholeReport {
+  final String potholeId;
+  final double lat;
+  final double lon;
+  final String severity;
+  final String? imageUrl;
+  final DateTime? createdAt;
+  final bool fixed;
+  final DateTime? fixedAt;
+  final String? fallType;
+  final double? confidence;
+  final String? weatherCondition;
+
+  const PotholeReport({
+    required this.potholeId,
+    required this.lat,
+    required this.lon,
+    required this.severity,
+    this.imageUrl,
+    this.createdAt,
+    required this.fixed,
+    this.fixedAt,
+    this.fallType,
+    this.confidence,
+    this.weatherCondition,
+  });
+
+  factory PotholeReport.fromJson(Map<String, dynamic> json) {
+    return PotholeReport(
+      potholeId:        json['pothole_id'] as String,
+      lat:              (json['lat'] as num).toDouble(),
+      lon:              (json['lon'] as num).toDouble(),
+      severity:         json['severity'] as String? ?? 'unknown',
+      imageUrl:         json['image_url'] as String?,
+      createdAt:        json['created_at'] != null
+          ? DateTime.tryParse(json['created_at'] as String)
+          : null,
+      fixed:            json['fixed'] as bool? ?? false,
+      fixedAt:          json['fixed_at'] != null
+          ? DateTime.tryParse(json['fixed_at'] as String)
+          : null,
+      fallType:         json['fall_type'] as String?,
+      confidence:       (json['confidence'] as num?)?.toDouble(),
+      weatherCondition: json['weather_condition'] as String?,
+    );
+  }
+
+  /// Returns a copy with fixed=true and fixedAt set to now.
+  PotholeReport copyWithFixed() => PotholeReport(
+        potholeId:        potholeId,
+        lat:              lat,
+        lon:              lon,
+        severity:         severity,
+        imageUrl:         imageUrl,
+        createdAt:        createdAt,
+        fixed:            true,
+        fixedAt:          DateTime.now(),
+        fallType:         fallType,
+        confidence:       confidence,
+        weatherCondition: weatherCondition,
+      );
 }

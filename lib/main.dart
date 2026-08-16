@@ -4,6 +4,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:geolocator/geolocator.dart';
 import 'screens/upload_pothole.dart';
 import 'screens/simulation_page.dart';
+import 'screens/reports_page.dart';                // ← NEW
 import 'services/background_service.dart';
 import 'services/alert_service.dart';
 import 'services/api_service.dart';
@@ -376,6 +377,20 @@ class _HomeScreenState extends State<HomeScreen> {
                   context,
                   MaterialPageRoute(
                     builder: (_) => const UploadPotholePage(),
+                  ),
+                );
+              },
+            ),
+
+            _drawerItem(
+              icon: Icons.report_outlined,
+              label: 'Reports',
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => const ReportsPage(),
                   ),
                 );
               },

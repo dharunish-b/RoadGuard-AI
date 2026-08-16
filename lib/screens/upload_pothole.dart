@@ -3,24 +3,32 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
+import '../services/local_report_store.dart';         // ← NEW
+import '../constants/simulation_coords.dart';   // ← shared sim coords
 import 'upload_pothole_widgets.dart';
 
 // =====================================================
 // UPLOAD POTHOLE PAGE  — 3-STEP FLOW
 //
 //  Step 1 — Camera: Take photo from any safe distance
+//           Mode toggle: Real GPS  |  Demo Coordinates
 //  Step 2 — Walk:   Instructions to go stand on pothole
-//  Step 3 — GPS:    User taps "Enable GPS" while standing
-//                   on pothole → live accuracy stream →
-//                   "Confirm & Upload" enabled at ≤ 10 m
+//           (skipped in demo mode — goes straight to step 3)
+//  Step 3 — GPS:    Real mode  → live accuracy stream
+//           Demo mode → shows pinned sim coords + upload button
 //
-// GPS is NEVER auto-started. User explicitly enables it
-// only after physically standing on the pothole.
-// This guarantees stored lat/lon = pothole position.
+// DEMO MODE (for stage presentations / indoor testing):
+//   Skips real GPS entirely. Uses kSimLat / kSimLng from
+//   simulation_coords.dart — the exact coordinates stored
+//   against the seeded demo pothole (kPotholeId).
+//   This means the simulation page will find & alert on
+//   the pothole you upload here, even inside a building.
 //
-// Result card, color scheme, ApiService.uploadPothole()
-// call signature all unchanged — friend's backend merges cleanly.
+// REAL MODE (outdoor use):
+//   Unchanged 3-step flow. GPS must reach ≤ 10 m accuracy
+//   before "Confirm & Upload" is enabled.
 // =====================================================
 
 class UploadPotholePage extends StatefulWidget {
@@ -35,15 +43,20 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
   // 1 = photo, 2 = walk instruction, 3 = GPS confirm
   int _step = 1;
 
+  // ── Mode ──────────────────────────────────────────
+  // true  = use kSimLat / kSimLng (indoor / stage demo)
+  // false = use real GPS (outdoor real-world use)
+  bool _demoMode = false;
+
   // ── Photo (step 1) ────────────────────────────────
   File? _image;
   final ImagePicker _picker = ImagePicker();
 
-  // ── GPS (step 3) ──────────────────────────────────
-  bool _gpsStarted = false;          // user has tapped "Enable GPS"
+  // ── GPS (step 3, real mode only) ──────────────────
+  bool _gpsStarted = false;
   bool _gpsPermissionDenied = false;
-  Position? _livePosition;           // updating from stream
-  Position? _confirmedPosition;      // locked on confirm tap
+  Position? _livePosition;
+  Position? _confirmedPosition;
   StreamSubscription<Position>? _posStream;
 
   // ── Upload ────────────────────────────────────────
@@ -62,8 +75,6 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
 
   // ===================================================
   // STEP 1 — TAKE PHOTO
-  // Opens rear camera. On success → step 2.
-  // GPS is NOT started here intentionally.
   // ===================================================
 
   Future<void> _takePhoto() async {
@@ -72,56 +83,39 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
       imageQuality: 85,
       preferredCameraDevice: CameraDevice.rear,
     );
-
-    if (picked == null) return; // user cancelled
-
+    if (picked == null) return;
     setState(() {
       _image = File(picked.path);
       _lastResult = null;
-      _step = 2; // go to walk instruction screen
+      // Demo mode: skip walk step, jump straight to confirm
+      _step = _demoMode ? 3 : 2;
     });
   }
-
-  // ===================================================
-  // STEP 1 (ALT) — PICK FROM GALLERY
-  // For users who already took the photo earlier and just
-  // need to upload it now. Same downstream flow as camera:
-  // goes straight to step 2 (walk to pothole) since GPS
-  // still needs to be captured live, standing on the spot.
-  // ===================================================
 
   Future<void> _pickFromGallery() async {
     final XFile? picked = await _picker.pickImage(
       source: ImageSource.gallery,
       imageQuality: 85,
     );
-
-    if (picked == null) return; // user cancelled
-
+    if (picked == null) return;
     setState(() {
       _image = File(picked.path);
       _lastResult = null;
-      _step = 2; // go to walk instruction screen
+      _step = _demoMode ? 3 : 2;
     });
   }
 
   // ===================================================
-  // STEP 2 → STEP 3
-  // User confirms they've walked to the pothole.
+  // STEP 2 → STEP 3 (real mode only)
   // ===================================================
 
-  void _proceedToGps() {
-    setState(() => _step = 3);
-  }
+  void _proceedToGps() => setState(() => _step = 3);
 
   // ===================================================
-  // STEP 3 — USER TAPS "Enable GPS"
-  // Only NOW does GPS start. User must already be
-  // physically standing on the pothole at this point.
+  // STEP 3 — ENABLE GPS (real mode only)
   // ===================================================
 
   Future<void> _enableGps() async {
-    // Check location service
     final enabled = await Geolocator.isLocationServiceEnabled();
     if (!enabled) {
       if (mounted) {
@@ -136,7 +130,6 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
       return;
     }
 
-    // Check / request permission
     LocationPermission perm = await Geolocator.checkPermission();
     if (perm == LocationPermission.denied) {
       perm = await Geolocator.requestPermission();
@@ -147,15 +140,11 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
       return;
     }
 
-    // Mark GPS as started — hides the button, shows accuracy UI
     setState(() {
       _gpsStarted = true;
       _gpsPermissionDenied = false;
     });
 
-    // Start high-accuracy position stream.
-    // distanceFilter: 0 = update even when user is standing still,
-    // so accuracy can keep improving as GPS satellite lock improves.
     _posStream = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.bestForNavigation,
@@ -167,22 +156,16 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
   }
 
   // ===================================================
-  // STEP 3 — CONFIRM LOCATION & UPLOAD
-  // Locks the current live position and uploads.
-  // Only callable when accuracy ≤ 10 m.
+  // UPLOAD — real GPS path
   // ===================================================
 
   Future<void> _confirmAndUpload() async {
     if (_livePosition == null || _image == null) return;
-
-    // Lock position
     setState(() {
       _confirmedPosition = _livePosition;
       _uploading = true;
       _lastResult = null;
     });
-
-    // Stop GPS stream — no longer needed
     await _posStream?.cancel();
     _posStream = null;
 
@@ -191,6 +174,22 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
       lat: _confirmedPosition!.latitude,
       lng: _confirmedPosition!.longitude,
     );
+
+    // Save to local cache so Reports page can show this user's own uploads
+    // with the actual photo (image path stays valid on this device).
+    if (result.success && result.potholeId != null) {
+      await LocalReportStore.instance.add(LocalPotholeReport(
+        potholeId:  result.potholeId!,
+        imagePath:  _image!.path,
+        lat:        _confirmedPosition!.latitude,
+        lon:        _confirmedPosition!.longitude,
+        severity:   _severityFromResult(result),
+        confidence: result.severity,
+        fallType:   result.detectionLabel,
+        uploadedAt: DateTime.now(),
+        isDemo:     false,
+      ));
+    }
 
     if (mounted) {
       setState(() {
@@ -201,7 +200,66 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
   }
 
   // ===================================================
-  // RESTART — report another pothole from step 1
+  // UPLOAD — demo / simulation coordinates path
+  // ===================================================
+
+  Future<void> _uploadWithSimCoords() async {
+    if (_image == null) return;
+    setState(() {
+      _uploading = true;
+      _lastResult = null;
+    });
+
+    final result = await ApiService.instance.uploadPothole(
+      imageFile: _image!,
+      lat: kSimLat,
+      lng: kSimLng,
+    );
+
+    if (result.success && result.potholeId != null) {
+      // Persist ID for SimulationController
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(kDemoPotholeIdKey, result.potholeId!);
+
+      // Save to local cache with image path + demo flag
+      await LocalReportStore.instance.add(LocalPotholeReport(
+        potholeId:  result.potholeId!,
+        imagePath:  _image!.path,
+        lat:        kSimLat,
+        lon:        kSimLng,
+        severity:   _severityFromResult(result),
+        confidence: result.severity,
+        fallType:   result.detectionLabel,
+        uploadedAt: DateTime.now(),
+        isDemo:     true,
+      ));
+    }
+
+    if (mounted) {
+      setState(() {
+        _uploading = false;
+        _lastResult = result;
+      });
+    }
+  }
+
+  // ===================================================
+  // HELPERS
+  // ===================================================
+
+  /// Maps UploadResult.alertStage back to a severity string
+  /// for local cache storage.
+  String _severityFromResult(UploadResult result) {
+    return switch (result.alertStage) {
+      1 => 'low',
+      2 => 'medium',
+      3 => 'high',
+      _ => 'unknown',
+    };
+  }
+
+  // ===================================================
+  // RESTART
   // ===================================================
 
   void _restart() {
@@ -216,6 +274,7 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
       _confirmedPosition = null;
       _lastResult = null;
       _uploading = false;
+      // keep _demoMode so user doesn't have to re-toggle
     });
   }
 
@@ -237,9 +296,7 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
                   _posStream = null;
                   setState(() {
                     _step = _step - 1;
-                    if (_step == 1) {
-                      _image = null;
-                    }
+                    if (_step == 1) _image = null;
                     _gpsStarted = false;
                     _livePosition = null;
                     _confirmedPosition = null;
@@ -259,7 +316,7 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
   }
 
   // ===================================================
-  // STEP 1 UI — Take Photo
+  // STEP 1 UI — Take Photo  +  Mode Toggle
   // ===================================================
 
   Widget _buildStep1() {
@@ -270,7 +327,15 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
         children: [
 
           const StepIndicator(activeStep: 1),
-          const SizedBox(height: 28),
+          const SizedBox(height: 20),
+
+          // ── MODE TOGGLE ────────────────────────────
+          _ModeToggle(
+            demoMode: _demoMode,
+            onChanged: (val) => setState(() => _demoMode = val),
+          ),
+
+          const SizedBox(height: 24),
 
           const Text(
             'Step 1: Take a photo of the pothole',
@@ -282,20 +347,21 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 8),
-          const Text(
-            'Stand at a safe distance and photograph the pothole.\n'
-            'You will mark its exact GPS location in the next steps.',
-            style: TextStyle(color: Colors.white54, fontSize: 13),
+          Text(
+            _demoMode
+                ? 'Take or pick a photo. The demo pothole coordinates\nwill be used — no need to go outdoors.'
+                : 'Stand at a safe distance and photograph the pothole.\n'
+                  'You will mark its exact GPS location in the next steps.',
+            style: const TextStyle(color: Colors.white54, fontSize: 13),
             textAlign: TextAlign.center,
           ),
 
-          const SizedBox(height: 32),
+          const SizedBox(height: 28),
 
-          // Tap-to-open-camera area
           GestureDetector(
             onTap: _takePhoto,
             child: Container(
-              height: 240,
+              height: 200,
               decoration: BoxDecoration(
                 color: const Color(0xFF161B22),
                 border: Border.all(color: const Color(0xFF30363D)),
@@ -305,8 +371,8 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Icon(Icons.camera_alt_outlined,
-                      size: 64, color: Color(0xFF1F6FEB)),
-                  SizedBox(height: 12),
+                      size: 56, color: Color(0xFF1F6FEB)),
+                  SizedBox(height: 10),
                   Text(
                     'Tap to open camera',
                     style: TextStyle(color: Colors.white70, fontSize: 16),
@@ -321,7 +387,7 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
             ),
           ),
 
-          const SizedBox(height: 20),
+          const SizedBox(height: 18),
 
           SizedBox(
             height: 52,
@@ -360,7 +426,6 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
 
           const SizedBox(height: 14),
 
-          // Already have a photo? Upload from gallery instead.
           SizedBox(
             height: 52,
             child: OutlinedButton.icon(
@@ -390,8 +455,7 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
   }
 
   // ===================================================
-  // STEP 2 UI — Walk Instruction
-  // No GPS here. Pure instruction screen.
+  // STEP 2 UI — Walk Instruction  (real mode only)
   // ===================================================
 
   Widget _buildStep2() {
@@ -404,7 +468,6 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
           const StepIndicator(activeStep: 2),
           const SizedBox(height: 28),
 
-          // Photo thumbnail confirm
           if (_image != null)
             ClipRRect(
               borderRadius: BorderRadius.circular(10),
@@ -430,7 +493,6 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
 
           const SizedBox(height: 28),
 
-          // Instruction card
           Container(
             padding: const EdgeInsets.all(20),
             decoration: BoxDecoration(
@@ -439,12 +501,12 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
                   color: const Color(0xFFF39C12).withOpacity(0.5)),
               borderRadius: BorderRadius.circular(12),
             ),
-            child: Column(
+            child: const Column(
               children: [
-                const Icon(Icons.directions_walk,
+                Icon(Icons.directions_walk,
                     color: Color(0xFFF39C12), size: 48),
-                const SizedBox(height: 14),
-                const Text(
+                SizedBox(height: 14),
+                Text(
                   'Step 2: Walk to the pothole',
                   style: TextStyle(
                     color: Colors.white,
@@ -453,40 +515,32 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
                   ),
                   textAlign: TextAlign.center,
                 ),
-                const SizedBox(height: 10),
-                const Text(
+                SizedBox(height: 10),
+                Text(
                   'Now walk and stand EXACTLY on or beside\n'
                   'the pothole you just photographed.\n\n'
                   'Once you are standing on it, tap the button\n'
                   'below to enable GPS and mark the location.',
-                  style: TextStyle(color: Colors.white60, fontSize: 13.5, height: 1.6),
+                  style: TextStyle(
+                      color: Colors.white60, fontSize: 13.5, height: 1.6),
                   textAlign: TextAlign.center,
                 ),
-                const SizedBox(height: 16),
-                // Visual tip
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 12, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF0D1117),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: const Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.info_outline,
-                          color: Colors.white38, size: 14),
-                      SizedBox(width: 6),
-                      Flexible(
-                        child: Text(
-                          'GPS will only start after you tap — '
-                          'this ensures the location is yours on the pothole.',
-                          style: TextStyle(
-                              color: Colors.white38, fontSize: 11),
-                        ),
+                SizedBox(height: 16),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.info_outline,
+                        color: Colors.white38, size: 14),
+                    SizedBox(width: 6),
+                    Flexible(
+                      child: Text(
+                        'GPS will only start after you tap — '
+                        'this ensures the location is yours on the pothole.',
+                        style:
+                            TextStyle(color: Colors.white38, fontSize: 11),
                       ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -519,13 +573,16 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
   }
 
   // ===================================================
-  // STEP 3 UI — GPS Confirm
-  // Two sub-states:
-  //   a) _gpsStarted == false → show "Enable GPS" button
-  //   b) _gpsStarted == true  → show live accuracy + confirm button
+  // STEP 3 UI — branches on _demoMode
   // ===================================================
 
   Widget _buildStep3() {
+    return _demoMode ? _buildStep3Demo() : _buildStep3Real();
+  }
+
+  // ── DEMO MODE: pinned sim coordinates, one-tap upload ──
+
+  Widget _buildStep3Demo() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(20),
       child: Column(
@@ -535,7 +592,153 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
           const StepIndicator(activeStep: 3),
           const SizedBox(height: 24),
 
-          // Photo thumbnail
+          if (_image != null)
+            Row(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: Image.file(_image!,
+                      width: 72, height: 54, fit: BoxFit.cover),
+                ),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Text(
+                    'Photo captured ✓\nUsing demo pothole coordinates.',
+                    style: TextStyle(color: Colors.white54, fontSize: 13),
+                  ),
+                ),
+              ],
+            ),
+
+          const SizedBox(height: 24),
+
+          // Pinned coordinate card
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: const Color(0xFF161B22),
+              border: Border.all(color: const Color(0xFF6E40C9)),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Row(
+                  children: [
+                    Icon(Icons.science,
+                        color: Color(0xFFBC8CFF), size: 20),
+                    SizedBox(width: 8),
+                    Text(
+                      'Demo Mode — Simulation Coordinates',
+                      style: TextStyle(
+                          color: Color(0xFFBC8CFF), fontSize: 13),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                const Text(
+                  'This photo will be uploaded to the seeded\n'
+                  'demo pothole location used by the Simulation page.',
+                  style: TextStyle(
+                      color: Colors.white60, fontSize: 13, height: 1.5),
+                ),
+                const SizedBox(height: 16),
+                const Divider(color: Color(0xFF30363D), height: 1),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    const Icon(Icons.location_pin,
+                        color: Colors.white24, size: 14),
+                    const SizedBox(width: 6),
+                    Text(
+                      '${kSimLat.toStringAsFixed(6)},   '
+                      '${kSimLng.toStringAsFixed(6)}',
+                      style: const TextStyle(
+                        color: Color(0xFFBC8CFF),
+                        fontSize: 13,
+                        fontFamily: 'monospace',
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'Pinned from simulation_coords.dart',
+                  style: TextStyle(color: Colors.white24, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 20),
+
+          // Result card
+          if (_lastResult != null) ...[
+            ResultCard(result: _lastResult!),
+            const SizedBox(height: 16),
+            if (_lastResult!.success)
+              OutlinedButton.icon(
+                onPressed: _restart,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white70,
+                  side: const BorderSide(color: Color(0xFF30363D)),
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+                icon: const Icon(Icons.add_a_photo),
+                label: const Text('Report Another Pothole'),
+              ),
+          ],
+
+          if (_lastResult == null)
+            SizedBox(
+              height: 52,
+              child: ElevatedButton.icon(
+                onPressed: _uploading ? null : _uploadWithSimCoords,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF6E40C9),
+                  foregroundColor: Colors.white,
+                  disabledBackgroundColor:
+                      const Color(0xFF6E40C9).withOpacity(0.25),
+                  disabledForegroundColor: Colors.white30,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10)),
+                  elevation: 0,
+                ),
+                icon: _uploading
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2, color: Colors.white),
+                      )
+                    : const Icon(Icons.science),
+                label: Text(
+                  _uploading ? 'Uploading…' : 'Upload to Demo Location',
+                  style: const TextStyle(
+                      fontSize: 15, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+
+          const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
+  // ── REAL MODE: unchanged GPS accuracy flow ──
+
+  Widget _buildStep3Real() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+
+          const StepIndicator(activeStep: 3),
+          const SizedBox(height: 24),
+
           if (_image != null)
             Row(
               children: [
@@ -556,7 +759,6 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
 
           const SizedBox(height: 24),
 
-          // ── SUB-STATE A: GPS not yet started ──
           if (!_gpsStarted) ...[
             Container(
               padding: const EdgeInsets.all(20),
@@ -587,7 +789,9 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
                     'Your current position will be used as the\n'
                     'pothole\'s location in the database.',
                     style: TextStyle(
-                        color: Colors.white60, fontSize: 13.5, height: 1.6),
+                        color: Colors.white60,
+                        fontSize: 13.5,
+                        height: 1.6),
                     textAlign: TextAlign.center,
                   ),
                 ],
@@ -596,7 +800,6 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
 
             const SizedBox(height: 20),
 
-            // GPS permission denied warning
             if (_gpsPermissionDenied)
               Container(
                 margin: const EdgeInsets.only(bottom: 16),
@@ -635,12 +838,10 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
             ),
           ],
 
-          // ── SUB-STATE B: GPS started, showing live accuracy ──
           if (_gpsStarted) ...[
             AccuracyCard(livePosition: _livePosition),
             const SizedBox(height: 20),
 
-            // Result card (shown after upload attempt)
             if (_lastResult != null) ...[
               ResultCard(result: _lastResult!),
               const SizedBox(height: 16),
@@ -657,7 +858,6 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
                 ),
             ],
 
-            // Confirm button — only shown before upload
             if (_lastResult == null)
               ConfirmButton(
                 livePosition: _livePosition,
@@ -671,5 +871,78 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
       ),
     );
   }
+}
 
+// =====================================================
+// MODE TOGGLE WIDGET
+// =====================================================
+
+class _ModeToggle extends StatelessWidget {
+  final bool demoMode;
+  final ValueChanged<bool> onChanged;
+
+  const _ModeToggle({
+    required this.demoMode,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161B22),
+        border: Border.all(color: const Color(0xFF30363D)),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        children: [
+          _tab(
+            label: '🛰  Real Location',
+            active: !demoMode,
+            onTap: () => onChanged(false),
+            activeColor: const Color(0xFF238636),
+          ),
+          const SizedBox(width: 4),
+          _tab(
+            label: '🔬  Demo Coordinates',
+            active: demoMode,
+            onTap: () => onChanged(true),
+            activeColor: const Color(0xFF6E40C9),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _tab({
+    required String label,
+    required bool active,
+    required VoidCallback onTap,
+    required Color activeColor,
+  }) {
+    return Expanded(
+      child: GestureDetector(
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            color: active ? activeColor : Colors.transparent,
+            borderRadius: BorderRadius.circular(7),
+          ),
+          child: Text(
+            label,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: active ? Colors.white : Colors.white38,
+              fontSize: 13,
+              fontWeight:
+                  active ? FontWeight.bold : FontWeight.normal,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
