@@ -46,8 +46,8 @@
 
 1. **Clone the repository:**
    ```bash
-   git clone <your-repo-url>
-   cd frontend
+   git clone https://github.com/dharunish-b/RoadGuard-AI.git
+   cd RoadGuard-AI
    ```
 
 2. **Install dependencies:**
