@@ -25,25 +25,42 @@ const String kMonitoringPref    = 'monitoring_active';
 const String kExplicitStartPref = 'explicit_start_requested';
 
 // =====================================================
+// MOVEMENT GATE CONSTANTS
+// =====================================================
+
+/// Minimum speed (km/h) before we bother hitting the backend.
+/// Below this we treat the rider as stationary — no DB query, no alert.
+/// Prevents battery drain and pointless $nearSphere calls at red lights.
+const double kMinSpeedKmh = 3.0;
+
+/// GPS accuracy must be better than this (metres) to use the reading.
+/// A 200m accuracy reading would trigger alerts for potholes 200m off-course.
+const double kMaxAccuracyM = 40.0;
+
+/// How long since the last position fix before we consider GPS stale.
+/// Stale = don't query backend; wait for fresh fix instead.
+const Duration kMaxPositionAge = Duration(seconds: 8);
+
+/// Real-time poll interval — how often the background loop checks GPS
+/// and queries /alert. 2 seconds gives ~1 second of total alert latency
+/// (1s GPS fix + 1s network) which is well inside any d_alert_m window
+/// even at 40 km/h (d_alert ≈ 35 m ÷ 11 m/s ≈ 3s to impact).
+const Duration kPollInterval = Duration(seconds: 2);
+
+// =====================================================
 // INIT — call once in main() before runApp()
 // =====================================================
 
 Future<void> initBackgroundService() async {
   final service = FlutterBackgroundService();
 
-  // ── Initialize notification plugin (main isolate only) ────────────
-  // This instance lives in the MAIN isolate. The background isolate
-  // gets its own separate Dart VM and must call initialize() itself.
   final plugin = FlutterLocalNotificationsPlugin();
 
   await plugin.initialize(
     const InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
     ),
-    // Fires when the app IS open and the user taps the boot notification.
     onDidReceiveNotificationResponse: _onBootTapForeground,
-    // Fires when the app is NOT open (just after reboot, e.g.).
-    // MUST be a top-level @pragma('vm:entry-point') function.
     onDidReceiveBackgroundNotificationResponse: _onBootTapBackground,
   );
 
@@ -51,7 +68,6 @@ Future<void> initBackgroundService() async {
       plugin.resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin>();
 
-  // Silent persistent foreground notification channel
   await androidImpl?.createNotificationChannel(
     const AndroidNotificationChannel(
       kForegroundChannelId,
@@ -61,7 +77,6 @@ Future<void> initBackgroundService() async {
     ),
   );
 
-  // High-priority hazard alert channel (stage 2 / 3 pop-ups)
   await androidImpl?.createNotificationChannel(
     const AndroidNotificationChannel(
       kAlertChannelId,
@@ -71,7 +86,6 @@ Future<void> initBackgroundService() async {
     ),
   );
 
-  // Boot consent channel (YES / No prompt after reboot)
   await androidImpl?.createNotificationChannel(
     const AndroidNotificationChannel(
       kBootChannelId,
@@ -81,13 +95,11 @@ Future<void> initBackgroundService() async {
     ),
   );
 
-  // ── Configure background service ──────────────────────────────────
   await service.configure(
     androidConfiguration: AndroidConfiguration(
       onStart: onServiceStart,
-      autoStart: false,        // never starts unless we call startService()
-      autoStartOnBoot: true,   // plugin's BroadcastReceiver fires on reboot
-                               // → we intercept in the consent gate below
+      autoStart: false,
+      autoStartOnBoot: true,
       isForegroundMode: true,
       notificationChannelId: kForegroundChannelId,
       initialNotificationTitle: 'Road Guard AI',
@@ -103,9 +115,6 @@ Future<void> initBackgroundService() async {
 
 // =====================================================
 // NOTIFICATION TAP HANDLERS
-//
-// Both MUST be top-level @pragma functions — never closures
-// or instance methods — so the AOT compiler keeps them.
 // =====================================================
 
 @pragma('vm:entry-point')
@@ -115,8 +124,6 @@ void _onBootTapForeground(NotificationResponse response) {
 
 @pragma('vm:entry-point')
 void _onBootTapBackground(NotificationResponse response) {
-  // Runs in a separate tiny isolate spawned by the notification system.
-  // Calling async functions is fine here.
   _handleBootResponse(response);
 }
 
@@ -142,7 +149,6 @@ Future<void> saveMonitoringState(bool isActive) async {
 
 // =====================================================
 // MARK EXPLICIT USER START
-// Call in HomeScreen RIGHT BEFORE service.startService()
 // =====================================================
 
 Future<void> markExplicitStart() async {
@@ -152,60 +158,31 @@ Future<void> markExplicitStart() async {
 
 // =====================================================
 // SERVICE ENTRY POINT
-// Runs in the BACKGROUND ISOLATE — completely separate
-// Dart VM from the main isolate. No shared memory.
-//
-// Called in exactly two situations:
-//   A) User pressed START (explicitStart = true)  → monitor
-//   B) Android rebooted  (explicitStart = false)  → ask first
 // =====================================================
 
 @pragma('vm:entry-point')
 void onServiceStart(ServiceInstance service) async {
-  // The background isolate has its own fresh Dart VM.
-  // Load the persisted ngrok URL from SharedPreferences.
   await ApiConfig.load();
 
-  final prefs        = await SharedPreferences.getInstance();
+  final prefs         = await SharedPreferences.getInstance();
   final bool explicit = prefs.getBool(kExplicitStartPref) ?? false;
 
-  // =============================================================
-  // PATH B — Android relaunched us (reboot or system restart).
-  //
-  // FIX: isForegroundMode:true means Android expects a foreground
-  // notification within ~5 seconds or it kills the service (ANR).
-  // We MUST call setForegroundNotificationInfo() immediately here,
-  // BEFORE the async notification show(), or the service is killed
-  // before the boot prompt ever appears.
-  // =============================================================
+  // ── PATH B: Boot relaunch — show consent prompt ───────────────
   if (!explicit) {
-    // Satisfy Android's foreground notification requirement first.
     if (service is AndroidServiceInstance) {
       await service.setForegroundNotificationInfo(
         title: 'Road Guard AI',
         content: 'Tap to resume monitoring…',
       );
     }
-
-    // Now show the boot consent prompt (YES / No thanks).
     await _showBootConsentPrompt(service);
-
-    // Stop the service — we're just a messenger, not monitoring yet.
     service.stopSelf();
     return;
   }
 
-  // =============================================================
-  // PATH A — Explicit user start (START button or YES on prompt).
-  // =============================================================
-
-  // Consume the one-shot flag so future silent relaunches don't
-  // bypass the consent gate.
+  // ── PATH A: Explicit user start ───────────────────────────────
   await prefs.setBool(kExplicitStartPref, false);
 
-  // Update foreground notification to "Active" now that we know
-  // we're actually monitoring. This is the fix for the missing
-  // "Monitoring active" notification after pressing START.
   if (service is AndroidServiceInstance) {
     await service.setForegroundNotificationInfo(
       title: '🛡️ Road Guard AI — Active',
@@ -213,27 +190,29 @@ void onServiceStart(ServiceInstance service) async {
     );
   }
 
-  // Handle STOP signal from HomeScreen.
-  // Also kill any live siren/torch — they live in THIS isolate now,
-  // so stopping the service alone won't silence them.
+  // ── Mutable config (updated via 'config' invoke) ──────────────
+  double speedKmh  = 30.0;
+  String weather   = 'dry';
+  String sessionId = '';
+
+  // ── STOP signal from HomeScreen ───────────────────────────────
   service.on('stop').listen((_) async {
     await AlertService.instance.stopAlert();
     service.stopSelf();
   });
 
-  // Receive config updates from the UI (speed, weather, backend URL)
-  double speedKmh = 30.0;
-  String weather  = 'dry';
-
+  // ── Config updates from UI ────────────────────────────────────
   service.on('config').listen((data) async {
     if (data == null) return;
-    speedKmh = (data['speed_kmh'] as num?)?.toDouble() ?? speedKmh;
-    weather  = data['weather']   as String? ?? weather;
+    speedKmh  = (data['speed_kmh'] as num?)?.toDouble() ?? speedKmh;
+    weather   = (data['weather']   as String?)            ?? weather;
+    sessionId = (data['session_id'] as String?)           ?? sessionId;
+
     final url = data['base_url'] as String?;
     if (url != null && url.trim().isNotEmpty) {
       await ApiConfig.setBaseUrl(url.trim());
     }
-    // Reflect current config in the foreground notification
+
     if (service is AndroidServiceInstance) {
       await service.setForegroundNotificationInfo(
         title: '🛡️ Road Guard AI — Active',
@@ -242,48 +221,131 @@ void onServiceStart(ServiceInstance service) async {
     }
   });
 
-  // Tracks the last alert level so we only re-trigger hardware on a
-  // CHANGE of stage, not every single 10s poll. Without this, a
-  // continuous stage3 would restart the looping siren + torch timer
-  // every 10 seconds, causing an audible stutter.
+  // ── Tracking state ────────────────────────────────────────────
+
+  /// Last alert level — we only re-trigger hardware on a CHANGE.
+  /// Prevents the looping siren restarting every 2 seconds.
   AlertLevel lastAlertLevel = AlertLevel.none;
 
-  // GPS poll + backend proximity check every 10 seconds
-  Timer.periodic(const Duration(seconds: 10), (timer) async {
+  /// Last position that passed all movement-gate checks.
+  /// Used to compute derived speed when device speed is unavailable.
+  Position? lastValidPosition;
+
+  /// Consecutive below-threshold readings before we silence a live alert.
+  /// Avoids flickering the alert off/on if GPS speed stutters for 1 cycle.
+  int stationaryCount = 0;
+  const int kStationaryThreshold = 3; // 3 × 2s = 6s of stillness → clear alert
+
+  // ── Main polling loop ─────────────────────────────────────────
+  // busy flag prevents a new tick from running while the previous
+  // one is still awaiting GPS or the backend. If a tick takes
+  // longer than kPollInterval the next one is simply skipped —
+  // no cascading queue build-up.
+  bool busy = false;
+
+  Timer.periodic(kPollInterval, (timer) async {
+    if (busy) return;
+    busy = true;
     try {
+      // ── 1. Location service + permission check ─────────────────
       if (!await Geolocator.isLocationServiceEnabled()) return;
 
       final LocationPermission perm = await Geolocator.checkPermission();
       if (perm == LocationPermission.denied ||
           perm == LocationPermission.deniedForever) return;
 
+      // ── 2. Get GPS fix ─────────────────────────────────────────
       final Position pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          timeLimit: Duration(seconds: 5),
+        ),
       );
 
+      // ── 3. ACCURACY GATE ───────────────────────────────────────
+      // Ignore fixes with poor horizontal accuracy.
+      // A 200 m accuracy bubble would trigger alerts for potholes
+      // on a completely different road.
+      if (pos.accuracy > kMaxAccuracyM) {
+        _updateForeground(
+          service,
+          '🛡️ Road Guard AI — Active',
+          'Waiting for GPS lock… (accuracy ${pos.accuracy.toStringAsFixed(0)} m)',
+        );
+        return;
+      }
+
+      // ── 4. MOVEMENT GATE ───────────────────────────────────────
+      // Prefer device-reported speed (accelerometer-fused).
+      // Fall back to Haversine displacement ÷ time if unavailable.
+      double effectiveSpeedKmh;
+
+      if (pos.speed >= 0) {
+        effectiveSpeedKmh = pos.speed * 3.6;
+      } else if (lastValidPosition != null) {
+        final double distM = Geolocator.distanceBetween(
+          lastValidPosition!.latitude,
+          lastValidPosition!.longitude,
+          pos.latitude,
+          pos.longitude,
+        );
+        final double dtSec =
+            pos.timestamp.difference(lastValidPosition!.timestamp).inMilliseconds /
+                1000.0;
+        effectiveSpeedKmh = dtSec > 0 ? (distM / dtSec) * 3.6 : 0;
+      } else {
+        effectiveSpeedKmh = 0;
+      }
+
+      lastValidPosition = pos;
+
+      if (effectiveSpeedKmh < kMinSpeedKmh) {
+        stationaryCount++;
+
+        if (stationaryCount >= kStationaryThreshold &&
+            lastAlertLevel != AlertLevel.none) {
+          await AlertService.instance.stopAlert();
+          lastAlertLevel = AlertLevel.none;
+          service.invoke('alert', {
+            'level':    AlertLevel.none.index,
+            'message':  'All clear',
+            'distance': null,
+            'severity': null,
+          });
+        }
+
+        _updateForeground(
+          service,
+          '🛡️ Road Guard AI — Active',
+          'Stationary · ${effectiveSpeedKmh.toStringAsFixed(1)} km/h',
+        );
+        return;
+      }
+
+      stationaryCount = 0;
+
+      // ── 5. QUERY BACKEND (/alert) ──────────────────────────────
       final PotholeAlert alert = await ApiService.instance.checkNearby(
         lat:      pos.latitude,
         lng:      pos.longitude,
-        speedKmh: speedKmh,
+        speedKmh: effectiveSpeedKmh,
         weather:  weather,
       );
 
-      // NEW — fire beep/torch/siren directly from THIS isolate.
-      // This is what makes real-time alerts work whether the app
-      // is foregrounded, backgrounded, or the screen is off — the
-      // background isolate keeps running as long as the foreground
-      // service notification is alive.
-      // Only re-trigger on a stage CHANGE so a sustained stage3
-      // siren doesn't restart every poll cycle.
+      // ── 6. HARDWARE ALERT — only on stage CHANGE ───────────────
+      // Prevents looping siren restarting every 2 s (audible glitch).
       if (alert.level != lastAlertLevel) {
-        await AlertService.instance.trigger(alert);
+        if (alert.level == AlertLevel.none) {
+          await AlertService.instance.stopAlert();
+        } else {
+          await AlertService.instance.trigger(alert);
+        }
         lastAlertLevel = alert.level;
       }
 
-      // Push alert level to the UI isolate too — purely for the
-      // in-app banner/state, NOT for triggering sound/torch again.
-      // (Main isolate must not call AlertService.trigger anymore,
-      // or you'd get double beeps/double flashes when app is open.)
+      // ── 7. PUSH STATE TO UI ISOLATE ───────────────────────────
+      // Main isolate updates the banner — must NOT call
+      // AlertService.trigger() again or you get double beeps.
       service.invoke('alert', {
         'level':    alert.level.index,
         'message':  alert.message,
@@ -291,53 +353,55 @@ void onServiceStart(ServiceInstance service) async {
         'severity': alert.severity,
       });
 
-      // Heads-up notification for stage 2 / 3 hazards
+      // ── 8. HEADS-UP NOTIFICATION (stage 2 / 3 only) ───────────
       await AlertNotificationHelper.showHazardNotification(alert);
 
-      // Keep the foreground notification live with last-checked time
-      if (service is AndroidServiceInstance) {
-        final now     = DateTime.now();
-        final timeStr =
-            '${now.hour.toString().padLeft(2, '0')}:'
-            '${now.minute.toString().padLeft(2, '0')}';
+      // ── 9. UPDATE FOREGROUND NOTIFICATION ─────────────────────
+      final now     = DateTime.now();
+      final timeStr =
+          '${now.hour.toString().padLeft(2, '0')}:'
+          '${now.minute.toString().padLeft(2, '0')}';
 
-        final String content = alert.level == AlertLevel.none
-            ? 'All clear · last checked $timeStr'
-            : '⚠️ ${alert.message} · $timeStr';
+      final String statusLine = alert.level == AlertLevel.none
+          ? '${effectiveSpeedKmh.toStringAsFixed(0)} km/h · clear · $timeStr'
+          : '⚠️ ${alert.message} · $timeStr';
 
-        await service.setForegroundNotificationInfo(
-          title: '🛡️ Road Guard AI — Active',
-          content: content,
-        );
-      }
+      _updateForeground(service, '🛡️ Road Guard AI — Active', statusLine);
+
     } catch (_) {
-      // Never crash the background service
+      // Never crash the background service on a single poll failure.
+    } finally {
+      busy = false;
     }
   });
 }
 
+// ─── Foreground notification helper ──────────────────────────────────────────
+
+void _updateForeground(
+  ServiceInstance service,
+  String title,
+  String content,
+) {
+  if (service is AndroidServiceInstance) {
+    service.setForegroundNotificationInfo(title: title, content: content);
+  }
+}
+
 // =====================================================
-// BOOT CONSENT PROMPT (runs inside background isolate)
-//
-// The background isolate has its OWN Dart VM — it has no
-// access to the FlutterLocalNotificationsPlugin instance
-// initialized in main(). We create a fresh local instance
-// here and initialize it before calling show().
+// BOOT CONSENT PROMPT
 // =====================================================
 
 Future<void> _showBootConsentPrompt(ServiceInstance service) async {
   final prefs = await SharedPreferences.getInstance();
   if (!(prefs.getBool(kMonitoringPref) ?? false)) return;
 
-  // Fresh plugin instance for this isolate
   final plugin = FlutterLocalNotificationsPlugin();
 
   await plugin.initialize(
     const InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
     ),
-    // Only the background handler matters here — the main isolate
-    // registers the foreground handler when the app opens.
     onDidReceiveBackgroundNotificationResponse: _onBootTapBackground,
   );
 
@@ -371,7 +435,7 @@ Future<void> _showBootConsentPrompt(ServiceInstance service) async {
           const AndroidNotificationAction(
             'action_yes',
             'YES, Resume',
-            showsUserInterface: true,   // opens the app
+            showsUserInterface: true,
             cancelNotification: true,
           ),
           const AndroidNotificationAction(
