@@ -178,7 +178,8 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
     // Save to local cache so Reports page can show this user's own uploads
     // with the actual photo (image path stays valid on this device).
     if (result.success && result.potholeId != null) {
-      await LocalReportStore.instance.add(LocalPotholeReport(
+      await LocalReportStore.instance.add(
+      LocalPotholeReport(
         potholeId:  result.potholeId!,
         imagePath:  _image!.path,
         lat:        _confirmedPosition!.latitude,
@@ -188,7 +189,9 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
         fallType:   result.detectionLabel,
         uploadedAt: DateTime.now(),
         isDemo:     false,
-      ));
+      ),
+      rawImagePath: _image!.path,   // ← ADD THIS
+    );
     }
 
     if (mounted) {
@@ -222,19 +225,21 @@ class _UploadPotholePageState extends State<UploadPotholePage> {
       await prefs.setString(kDemoPotholeIdKey, result.potholeId!);
 
       // Save to local cache with image path + demo flag
-      await LocalReportStore.instance.add(LocalPotholeReport(
-        potholeId:  result.potholeId!,
-        imagePath:  _image!.path,
-        lat:        kSimLat,
-        lon:        kSimLng,
-        severity:   _severityFromResult(result),
-        confidence: result.severity,
-        fallType:   result.detectionLabel,
-        uploadedAt: DateTime.now(),
-        isDemo:     true,
-      ));
+      await LocalReportStore.instance.add(
+        LocalPotholeReport(
+          potholeId:  result.potholeId!,
+          imagePath:  _image!.path,
+          lat:        kSimLat,
+          lon:        kSimLng,
+          severity:   _severityFromResult(result),
+          confidence: result.severity,
+          fallType:   result.detectionLabel,
+          uploadedAt: DateTime.now(),
+          isDemo:     true,
+        ),
+        rawImagePath: _image!.path,   // ← ADD THIS
+      );
     }
-
     if (mounted) {
       setState(() {
         _uploading = false;

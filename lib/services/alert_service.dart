@@ -16,13 +16,36 @@ class AlertService {
   Timer? _flashTimer;
   bool _torchOn = false;
 
-  // NEW — cached once per app/isolate lifetime so we don't ask the
-  // platform channel on every single alert.
-  bool? _hasVibrator;
+  // =====================================================
+  // SAFE VIBRATE
+  //
+  // Does NOT use Vibration.hasVibrator() — that call
+  // returns null/false in background isolates even on
+  // phones that do have a vibrator (needs main Context).
+  // Instead we just attempt vibration directly and catch
+  // any error silently. If the device has no vibrator,
+  // the plugin throws and we ignore it.
+  // =====================================================
 
-  Future<bool> _canVibrate() async {
-    _hasVibrator ??= await Vibration.hasVibrator() ?? false;
-    return _hasVibrator!;
+  Future<void> _safeVibrate({
+    List<int>? pattern,
+    List<int>? intensities,
+    int? duration,
+    int repeat = -1,
+  }) async {
+    try {
+      if (pattern != null) {
+        await Vibration.vibrate(
+          pattern:     pattern,
+          intensities: intensities ?? [],
+          repeat:      repeat,
+        );
+      } else {
+        await Vibration.vibrate(duration: duration ?? 300);
+      }
+    } catch (e) {
+      print('[AlertService] vibration error: $e');
+    }
   }
 
   // =====================================================
@@ -38,11 +61,15 @@ class AlertService {
 
     // Stop anything from the previous alert first.
     await _cancelFlash();
-    await _player.stop();
-    await Vibration.cancel();
 
-    // Always reset looping before a new alert.
-    await _player.setReleaseMode(ReleaseMode.release);
+    try {
+      await _player.stop();
+      await _player.setReleaseMode(ReleaseMode.release);
+    } catch (_) {}
+
+    try {
+      await Vibration.cancel();
+    } catch (_) {}
 
     switch (alert.level) {
       case AlertLevel.none:
@@ -67,131 +94,93 @@ class AlertService {
   }
 
   // =====================================================
-  // STAGE 1
+  // STAGE 1 — soft beep + single short buzz
   // =====================================================
 
   Future<void> _stage1() async {
+    // Audio — fire and forget so vibration is never blocked
     try {
       await _player.stop();
-
       await _player.setReleaseMode(ReleaseMode.release);
       await _player.setVolume(1.0);
-
-      print('[AlertService] Playing Stage 1 sound');
-
-      await _player.play(
-        AssetSource('sounds/beep_soft.mp3'),
-      );
-
+      _player.play(AssetSource('sounds/beep_soft.mp3')); // no await
       print('[AlertService] Stage 1 sound started');
     } catch (e) {
       print('[AlertService] STAGE 1 AUDIO ERROR: $e');
     }
 
-    // Single short buzz — matches the soft beep, just a heads-up.
-    if (await _canVibrate()) {
-      try {
-        await Vibration.vibrate(duration: 200, amplitude: 128);
-      } catch (e) {
-        print('[AlertService] STAGE 1 VIBRATION ERROR: $e');
-      }
-    }
+    // Single short buzz
+    await _safeVibrate(duration: 200);
   }
 
   // =====================================================
-  // STAGE 2
+  // STAGE 2 — medium alert + 3 vibration pulses + 3 flashes
   // =====================================================
 
   Future<void> _stage2() async {
+    // Audio — fire and forget
     try {
       await _player.stop();
-
       await _player.setReleaseMode(ReleaseMode.release);
       await _player.setVolume(1.0);
-
-      print('[AlertService] Playing Stage 2 sound');
-
-      await _player.play(
-        AssetSource('sounds/alert_medium.mp3'),
-      );
-
+      _player.play(AssetSource('sounds/alert_medium.mp3')); // no await
       print('[AlertService] Stage 2 sound started');
     } catch (e) {
       print('[AlertService] STAGE 2 AUDIO ERROR: $e');
     }
 
-    // 3 pulses of vibration, timed with the 3 torch flashes below.
-    // pattern = [wait, vibrate, wait, vibrate, wait, vibrate]
-    if (await _canVibrate()) {
-      try {
-        await Vibration.vibrate(
-          pattern: [0, 150, 150, 150, 150, 150],
-          intensities: [0, 200, 0, 200, 0, 200],
-        );
-      } catch (e) {
-        print('[AlertService] STAGE 2 VIBRATION ERROR: $e');
-        // Fallback for devices without amplitude/pattern support.
-        try {
-          await Vibration.vibrate(duration: 400);
-        } catch (_) {}
-      }
+    // 3 vibration pulses — try pattern first, fallback to single buzz
+    try {
+      await Vibration.vibrate(
+        pattern:     [0, 150, 150, 150, 150, 150],
+        intensities: [0, 200,   0, 200,   0, 200],
+      );
+    } catch (e) {
+      print('[AlertService] STAGE 2 VIBRATION PATTERN ERROR: $e');
+      // Fallback — plain vibration, no amplitude/pattern
+      await _safeVibrate(duration: 400);
     }
 
-    // 3 quick flashes
+    // 3 quick flashes — run after vibration starts (not blocked)
     for (int i = 0; i < 3; i++) {
       await _flashOn();
-
-      await Future.delayed(
-        const Duration(milliseconds: 150),
-      );
-
+      await Future.delayed(const Duration(milliseconds: 150));
       await _flashOff();
-
-      await Future.delayed(
-        const Duration(milliseconds: 150),
-      );
+      await Future.delayed(const Duration(milliseconds: 150));
     }
   }
 
   // =====================================================
-  // STAGE 3
+  // STAGE 3 — siren loop + continuous vibration + rapid flash
   // =====================================================
 
   Future<void> _stage3() async {
+    // Audio — fire and forget
     try {
       await _player.stop();
-
       await _player.setVolume(1.0);
       await _player.setReleaseMode(ReleaseMode.loop);
-
-      print('[AlertService] Playing Stage 3 siren');
-
-      await _player.play(
-        AssetSource('sounds/siren.mp3'),
-      );
-
+      _player.play(AssetSource('sounds/siren.mp3')); // no await
       print('[AlertService] Stage 3 siren started');
     } catch (e) {
       print('[AlertService] STAGE 3 AUDIO ERROR: $e');
     }
 
-    // Continuous strong vibration, looped — matches siren + torch urgency.
-    // pattern[0] is a leading 0ms wait, then alternating vibrate/pause,
-    // repeat: 1 tells the plugin to loop starting from pattern index 1
-    // indefinitely until Vibration.cancel() is called (in stopAlert()).
-    if (await _canVibrate()) {
-      try {
-        await Vibration.vibrate(
-          pattern: [0, 300, 200],
-          intensities: [0, 255, 0],
-          repeat: 1,
-        );
-      } catch (e) {
-        print('[AlertService] STAGE 3 VIBRATION ERROR: $e');
-      }
+    // Continuous looping vibration
+    // repeat: 1 = loop from index 1 indefinitely until Vibration.cancel()
+    try {
+      await Vibration.vibrate(
+        pattern:     [0, 300, 200],
+        intensities: [0, 255,   0],
+        repeat:      1,
+      );
+    } catch (e) {
+      print('[AlertService] STAGE 3 VIBRATION ERROR: $e');
+      // Fallback — long single buzz
+      await _safeVibrate(duration: 1000);
     }
 
-    // Continuous flashlight.
+    // Continuous flashlight timer
     _flashTimer = Timer.periodic(
       const Duration(milliseconds: 200),
       (_) async {
@@ -228,7 +217,7 @@ class AlertService {
   }
 
   // =====================================================
-  // FLASH
+  // FLASH HELPERS
   // =====================================================
 
   Future<void> _flashOn() async {
@@ -266,9 +255,9 @@ class AlertService {
     _flashTimer?.cancel();
     _flashTimer = null;
 
-    await Vibration.cancel();
-    await _player.stop();
-    await _player.dispose();
+    try { await Vibration.cancel(); } catch (_) {}
+    try { await _player.stop(); } catch (_) {}
+    try { await _player.dispose(); } catch (_) {}
   }
 }
 
@@ -310,15 +299,14 @@ class AlertNotificationHelper {
         android: AndroidNotificationDetails(
           'road_guard_alerts',
           'Hazard Alerts',
-          channelDescription:
-              'Pothole and road hazard warnings',
+          channelDescription: 'Pothole and road hazard warnings',
           importance:
               alert.level == AlertLevel.stage3
                   ? Importance.max
                   : Importance.high,
-          priority: Priority.high,
+          priority:        Priority.high,
           enableVibration: true,
-          playSound: false,
+          playSound:       false,
         ),
       ),
     );

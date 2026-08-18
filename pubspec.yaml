@@ -2,7 +2,7 @@ name: roadguard
 description: "RoadGuard - AI Powered Road Safety Application"
 publish_to: 'none'
 
-version: 1.0.0+1
+version: 1.1.0+2
 
 environment:
   sdk: ^3.12.2
@@ -27,10 +27,16 @@ dependencies:
 
   # Sound Player
   audioplayers: ^6.5.1
-  
-  # ADD THESE:
-  http: ^1.2.1                  # API calls to FastAPI
-  shared_preferences: ^2.2.3    # persist monitoring on/off state
+
+  # API calls to FastAPI
+  http: ^1.2.1
+
+  # Persist monitoring on/off state + report cache
+  shared_preferences: ^2.2.3
+
+  # Permanent local file storage for report images
+  path_provider: ^2.1.2
+  path: ^1.9.0
 
   # Background Service — keeps GPS monitoring alive after app is minimized
   flutter_background_service: ^5.0.5
