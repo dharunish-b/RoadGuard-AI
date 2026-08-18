@@ -1,6 +1,9 @@
 <div align="center">
   <img src="road-guard-ai.png" alt="Road Guard AI Logo" width="500" height="500"/>
   <h1>Road Guard- AI 📱</h1>
+  <a href="https://github.com/dharunish-b/RoadGuard-AI/releases/download/v1.1.0/RoadGuard-AI-v1.1.0.apk"> 
+    <img src="https://img.shields.io/badge/Download_App_APK-2ea44f?style=for-the-badge&logo=android"   alt="Download APK" /> 
+  </a>
   <p><em>AI-Powered Pothole Detection & Rider Safety Application</em></p>
 </div>
 
