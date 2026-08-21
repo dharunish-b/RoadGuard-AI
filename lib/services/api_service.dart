@@ -234,6 +234,7 @@ class ApiService {
     required String potholeId,
     required int step,
     required String condition,
+    required double speedKmh,
   }) async {
     try {
       final uri = Uri.parse('${ApiConfig.baseUrl}/simulate/step').replace(
@@ -241,6 +242,7 @@ class ApiService {
           'pothole_id': potholeId,
           'step': step.toString(),
           'condition': condition,
+          'speed_kmh': speedKmh.toString(),
         },
       );
 

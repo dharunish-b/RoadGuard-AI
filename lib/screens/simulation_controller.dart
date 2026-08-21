@@ -7,133 +7,16 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
 import '../services/alert_service.dart';
 import '../constants/simulation_coords.dart';
-
-// =====================================================
-// SIMULATION CONFIGURATION
-//
-// 6 simulation steps
-//
-// Step 1 -> 10 seconds
-// Step 2 -> 10 seconds
-// Step 3 -> 8 seconds
-// Step 4 -> 8 seconds
-// Step 5 -> 7 seconds
-// Step 6 -> 7 seconds
-//
-// TOTAL = 50 SECONDS
-//
-// Destination:
-//     kSimLat = 9.9252
-//     kSimLng = 78.1198
-//
-// The simulation gradually moves toward the destination.
-// =====================================================
-
-const int kTotalSteps = 6;
-
-const int kCooldownDurationSec = 180;
-
-/// Duration of each simulation step.
-int stepDurationFor(int step) => switch (step) {
-      1 => 10,
-      2 => 10,
-      3 => 8,
-      4 => 8,
-      5 => 7,
-      _ => 7,
-    };
-
-/// Alert level for each simulation step.
-///
-/// Step 1-2:
-///     Stage 1 = early caution / light buzzer
-///
-/// Step 3-4:
-///     Stage 2 = warning / buzzer
-///
-/// Step 5-6:
-///     Stage 3 = danger / siren
-AlertLevel levelForStep(int step) => switch (step) {
-      1 || 2 => AlertLevel.stage1,
-      3 || 4 => AlertLevel.stage2,
-      _ => AlertLevel.stage3,
-    };
-
-/// Fallback message when backend returns an empty message.
-String fallbackMsg(AlertLevel level) => switch (level) {
-      AlertLevel.stage1 =>
-        'Pothole detected ahead — caution',
-      AlertLevel.stage2 =>
-        'Pothole approaching — slow down',
-      AlertLevel.stage3 =>
-        'SEVERE pothole — danger zone',
-      _ =>
-        'All clear',
-    };
-
-/// Formats seconds as M:SS.
-String fmtCountdown(int totalSeconds) {
-  final int m = totalSeconds ~/ 60;
-  final int s = totalSeconds % 60;
-
-  return '$m:${s.toString().padLeft(2, '0')}';
-}
-
-// =====================================================
-// SIMULATION COORDINATES
-// =====================================================
-
-class SimulationPoint {
-  const SimulationPoint({
-    required this.latitude,
-    required this.longitude,
-  });
-
-  final double latitude;
-  final double longitude;
-}
-
-/// Demo route.
-///
-/// Step 1 = far from pothole
-/// Step 2 = getting closer
-/// Step 3 = warning begins
-/// Step 4 = close
-/// Step 5 = very close
-/// Step 6 = destination
-///
-/// The final point ALWAYS uses kSimLat/kSimLng.
-List<SimulationPoint> get simulationRoute {
-  return [
-    SimulationPoint(
-      latitude: kSimLat - 0.0015,
-      longitude: kSimLng - 0.0015,
-    ),
-    SimulationPoint(
-      latitude: kSimLat - 0.0012,
-      longitude: kSimLng - 0.0012,
-    ),
-    SimulationPoint(
-      latitude: kSimLat - 0.0008,
-      longitude: kSimLng - 0.0008,
-    ),
-    SimulationPoint(
-      latitude: kSimLat - 0.0005,
-      longitude: kSimLng - 0.0005,
-    ),
-    SimulationPoint(
-      latitude: kSimLat - 0.0002,
-      longitude: kSimLng - 0.0002,
-    ),
-    SimulationPoint(
-      latitude: kSimLat,
-      longitude: kSimLng,
-    ),
-  ];
-}
+import 'simulation_config.dart';
+import 'simulation_status.dart';
 
 // =====================================================
 // SIMULATION CONTROLLER
+//
+// Owns simulation state + timers. Step timing, speed
+// curve, alert-level curve, and route live in
+// simulation_config.dart. Display text lives in
+// simulation_status.dart. This file is just orchestration.
 // =====================================================
 
 class SimulationController {
@@ -156,6 +39,10 @@ class SimulationController {
   // ===================================================
 
   double speedKmh = 20;
+
+  /// Live simulated speed for current step. Ramps up
+  /// then down across route. UI binds to this.
+  double currentSpeedKmh = 0;
 
   String weather = 'dry';
 
@@ -210,8 +97,7 @@ class SimulationController {
   // STATUS
   // ===================================================
 
-  String statusMsg =
-      'Configure and press Start Simulation';
+  String statusMsg = statusIdle;
 
   // ===================================================
   // BACKEND
@@ -460,7 +346,7 @@ class SimulationController {
       altitudeAccuracy: 3.0,
       heading: 0.0,
       headingAccuracy: 0.0,
-      speed: speedKmh / 3.6,
+      speed: currentSpeedKmh / 3.6,
       speedAccuracy: 0.5,
       floor: null,
       isMocked: true,
@@ -562,8 +448,7 @@ class SimulationController {
     lastTriggeredLevel =
         AlertLevel.none;
 
-    statusMsg =
-        'Starting demo route…';
+    statusMsg = statusStarting;
 
     onStateChanged();
 
@@ -598,6 +483,38 @@ class SimulationController {
         }
 
         secondsRemaining--;
+
+        // ===============================================
+        // SMOOTH LIVE SPEED
+        //
+        // Interpolate current step's base speed toward
+        // next step's base speed as secondsRemaining
+        // counts down, so UI reads a live changing
+        // number instead of a jump at step boundary.
+        // ===============================================
+
+        final int dur =
+            stepDurationFor(currentStep);
+
+        final double elapsedFrac =
+            dur == 0
+                ? 1.0
+                : (1 - (secondsRemaining / dur))
+                    .clamp(0.0, 1.0);
+
+        final int nextStep =
+            currentStep + 1 > kTotalSteps
+                ? currentStep
+                : currentStep + 1;
+
+        final double fromSpeed =
+            speedKmh * speedMultiplierFor(currentStep);
+
+        final double toSpeed =
+            speedKmh * speedMultiplierFor(nextStep);
+
+        currentSpeedKmh = fromSpeed +
+            (toSpeed - fromSpeed) * elapsedFrac;
 
         onStateChanged();
 
@@ -636,6 +553,14 @@ class SimulationController {
     currentStep++;
 
     // =================================================
+    // SET STEP BASE SPEED (before building position,
+    // since position.speed reads currentSpeedKmh)
+    // =================================================
+
+    currentSpeedKmh =
+        speedKmh * speedMultiplierFor(currentStep);
+
+    // =================================================
     // UPDATE SIMULATED GPS
     // =================================================
 
@@ -652,28 +577,10 @@ class SimulationController {
               );
 
     // =================================================
-    // STATUS
+    // STATUS (start of step)
     // =================================================
 
-    if (currentStep == 1) {
-      statusMsg =
-          'Step 1 of 6 — approaching pothole';
-    } else if (currentStep == 2) {
-      statusMsg =
-          'Step 2 of 6 — pothole getting closer';
-    } else if (currentStep == 3) {
-      statusMsg =
-          'Step 3 of 6 — WARNING BUZZER ACTIVE';
-    } else if (currentStep == 4) {
-      statusMsg =
-          'Step 4 of 6 — pothole very close';
-    } else if (currentStep == 5) {
-      statusMsg =
-          'Step 5 of 6 — DANGER WARNING';
-    } else {
-      statusMsg =
-          'Step 6 of 6 — DESTINATION REACHED';
-    }
+    statusMsg = statusForStepStart(currentStep);
 
     onStateChanged();
 
@@ -684,38 +591,14 @@ class SimulationController {
     await _poll();
 
     // =================================================
-    // AFTER POLL
+    // STATUS (after poll completes)
     // =================================================
 
-    statusMsg = isLast
-        ? 'Destination reached — starting cooldown…'
-        : 'Step $currentStep of $kTotalSteps complete '
-            '· next in ${nextDur}s';
-
-    // Make buzzer status visible in UI.
-    if (currentStep == 3) {
-      statusMsg =
-          '⚠ WARNING BUZZER — '
-          'pothole approaching';
-    }
-
-    if (currentStep == 4) {
-      statusMsg =
-          '⚠ BUZZER ACTIVE — '
-          'pothole very close';
-    }
-
-    if (currentStep == 5) {
-      statusMsg =
-          '🚨 DANGER WARNING — '
-          'pothole extremely close';
-    }
-
-    if (currentStep == 6) {
-      statusMsg =
-          '🚨 DESTINATION REACHED — '
-          'pothole zone';
-    }
+    statusMsg = statusForStepComplete(
+      step: currentStep,
+      isLast: isLast,
+      nextDur: nextDur,
+    );
 
     onStateChanged();
 
@@ -786,6 +669,7 @@ class SimulationController {
       potholeId: _activePotholeId,
       step: currentStep - 1,
       condition: weather,
+      speedKmh: speedKmh,
     );
 
     // =================================================
@@ -814,14 +698,9 @@ class SimulationController {
     // =================================================
     // TRIGGER ALERT ONLY WHEN LEVEL CHANGES
     //
-    // Step 1:
-    //     Stage 1
-    //
-    // Step 3:
-    //     Stage 2 -> BUZZER/WARNING
-    //
-    // Step 5:
-    //     Stage 3 -> DANGER/SIREN
+    // Step 1-2: Stage 1
+    // Step 3-5: Stage 2 -> BUZZER/WARNING
+    // Step 6-7: Stage 3 -> DANGER/SIREN
     // =================================================
 
     if (level != lastTriggeredLevel) {
@@ -854,6 +733,8 @@ class SimulationController {
 
     running = false;
 
+    currentSpeedKmh = 0;
+
     inCooldown = true;
 
     cooldownRemaining =
@@ -878,11 +759,7 @@ class SimulationController {
       (Timer timer) {
         cooldownRemaining--;
 
-        statusMsg =
-            'Pothole zone clearing in '
-            '${fmtCountdown(
-          cooldownRemaining,
-        )}…';
+        statusMsg = statusForCooldown(cooldownRemaining);
 
         onStateChanged();
 
@@ -901,8 +778,7 @@ class SimulationController {
           // Keep destination visible after
           // simulation until another simulation starts.
 
-          statusMsg =
-              'All clear — pothole zone passed ✅';
+          statusMsg = statusAllClear;
 
           onStateChanged();
         }
@@ -944,8 +820,9 @@ class SimulationController {
 
     secondsRemaining = 0;
 
-    statusMsg =
-        'Simulation stopped';
+    currentSpeedKmh = 0;
+
+    statusMsg = statusStopped;
 
     onStateChanged();
   }

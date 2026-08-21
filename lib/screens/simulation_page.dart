@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
-
+import 'simulation_config.dart';
 import '../services/api_service.dart';
 import '../services/alert_service.dart';
 import 'simulation_controller.dart';
@@ -1588,6 +1588,70 @@ class _SimulationPageState extends State<SimulationPage> {
               ),
             ),
           ),
+
+          if (_ctrl.running) ...[
+            const SizedBox(height: 10),
+
+            Row(
+              mainAxisAlignment:
+                  MainAxisAlignment.spaceBetween,
+
+              children: [
+                const Text(
+                  'Live speed',
+
+                  style: TextStyle(
+                    color: Colors.white54,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+
+                Text(
+                  '${_ctrl.currentSpeedKmh.toStringAsFixed(1)} km/h',
+
+                  style: const TextStyle(
+                    color: Color(0xFF3FB950),
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 6),
+
+            Row(
+              mainAxisAlignment:
+                  MainAxisAlignment.spaceBetween,
+
+              children: [
+                const Text(
+                  'Road condition',
+
+                  style: TextStyle(
+                    color: Colors.white54,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+
+                Text(
+                  _ctrl.weather == 'rain'
+                      ? '🌧️ Rain'
+                      : '☀️ Dry',
+
+                  style: TextStyle(
+                    color: _ctrl.weather == 'rain'
+                        ? const Color(0xFF58A6FF)
+                        : const Color(0xFFF0B429),
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );
@@ -1956,7 +2020,7 @@ class _SimulationPageState extends State<SimulationPage> {
 
           _timingRow(
             'Steps 1-2',
-            '20s each',
+            '10s each',
             const Color(
               0xFFF39C12,
             ),
@@ -1966,7 +2030,7 @@ class _SimulationPageState extends State<SimulationPage> {
 
           _timingRow(
             'Steps 3-4',
-            '15s each',
+            '8s each',
             const Color(
               0xFFE67E22,
             ),
@@ -1975,8 +2039,8 @@ class _SimulationPageState extends State<SimulationPage> {
           const SizedBox(height: 4),
 
           _timingRow(
-            'Steps 5-6',
-            '10s each',
+            'Step 5',
+            '7s',
             const Color(
               0xFFE74C3C,
             ),
